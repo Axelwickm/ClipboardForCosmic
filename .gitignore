@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
