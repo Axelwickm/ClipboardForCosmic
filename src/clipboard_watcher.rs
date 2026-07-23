@@ -41,6 +41,7 @@ pub struct ClipboardImage {
     pub thumbnail_rgba: Arc<[u8]>,
     pub thumbnail_width: u32,
     pub thumbnail_height: u32,
+    pub is_svg: bool,
 }
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
@@ -84,7 +85,11 @@ pub fn copy_image(image: ClipboardImage) {
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
     std::thread::spawn(move || {
-        if let Err(error) = provide_clipboard(None, None, Some(image), generation) {
+        let text = image
+            .is_svg
+            .then(|| String::from_utf8(image.bytes.as_ref().to_vec()).ok())
+            .flatten();
+        if let Err(error) = provide_clipboard(text, None, Some(image), generation) {
             eprintln!("Clipboard History could not set the clipboard image: {error}");
         }
     });
@@ -207,14 +212,22 @@ async fn watch(
             decode_image(&mime, bytes).map(|image| (image_label(&image), None, Some(image)))
         } else {
             String::from_utf8(bytes).ok().map(|text| {
-                let color = parse_color_expression(&text);
-                (text, color, None)
+                if let Some(image) = detect_svg_text(&text) {
+                    (image_label(&image), None, Some(image))
+                } else {
+                    let color = parse_color_expression(&text);
+                    (text, color, None)
+                }
             })
         };
         if let Some((text, color_rgba, image)) = content {
+            let recorded_mime = image
+                .as_ref()
+                .map(|image| image.mime_type.clone())
+                .unwrap_or(mime);
             let _ = sender.send(ClipboardUpdate {
                 text,
-                mime_type: mime,
+                mime_type: recorded_mime,
                 available_mime_types: mime_types,
                 color_rgba,
                 image,
@@ -234,6 +247,7 @@ fn preferred_mime(mime_types: &[String]) -> Option<&str> {
         "image/bmp",
         "image/x-bmp",
         "image/tiff",
+        "image/svg+xml",
         "application/x-color",
         "text/plain;charset=utf-8",
         "text/plain",
@@ -250,7 +264,7 @@ fn preferred_mime(mime_types: &[String]) -> Option<&str> {
 }
 
 fn is_image_mime(mime: &str) -> bool {
-    image_format(mime).is_some()
+    mime == "image/svg+xml" || image_format(mime).is_some()
 }
 
 fn image_format(mime: &str) -> Option<image::ImageFormat> {
@@ -266,6 +280,9 @@ fn image_format(mime: &str) -> Option<image::ImageFormat> {
 }
 
 fn decode_image(mime_type: &str, bytes: Vec<u8>) -> Option<ClipboardImage> {
+    if mime_type == "image/svg+xml" {
+        return decode_svg(bytes);
+    }
     use image::GenericImageView;
 
     let decoded = image::load_from_memory_with_format(&bytes, image_format(mime_type)?).ok()?;
@@ -282,7 +299,55 @@ fn decode_image(mime_type: &str, bytes: Vec<u8>) -> Option<ClipboardImage> {
         thumbnail_rgba: Arc::from(thumbnail.into_raw()),
         thumbnail_width,
         thumbnail_height,
+        is_svg: false,
     })
+}
+
+fn decode_svg(bytes: Vec<u8>) -> Option<ClipboardImage> {
+    let tree = resvg::usvg::Tree::from_data(&bytes, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let width = size.width().round().max(1.0) as u32;
+    let height = size.height().round().max(1.0) as u32;
+    let scale = (THUMBNAIL_SIZE as f32 / size.width())
+        .min(THUMBNAIL_SIZE as f32 / size.height())
+        .min(1.0);
+    let thumbnail_width = (size.width() * scale).round().max(1.0) as u32;
+    let thumbnail_height = (size.height() * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(thumbnail_width, thumbnail_height)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let mut thumbnail_rgba = pixmap.take();
+    for pixel in thumbnail_rgba.chunks_exact_mut(4) {
+        let alpha = u16::from(pixel[3]);
+        for channel in &mut pixel[..3] {
+            *channel = (u16::from(*channel) * 255)
+                .checked_div(alpha)
+                .unwrap_or(0)
+                .min(255) as u8;
+        }
+    }
+    Some(ClipboardImage {
+        mime_type: "image/svg+xml".into(),
+        bytes: Arc::from(bytes),
+        width,
+        height,
+        thumbnail_rgba: Arc::from(thumbnail_rgba),
+        thumbnail_width,
+        thumbnail_height,
+        is_svg: true,
+    })
+}
+
+fn detect_svg_text(text: &str) -> Option<ClipboardImage> {
+    let trimmed = text.trim();
+    let plausible_svg =
+        trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && trimmed.contains("<svg"));
+    plausible_svg
+        .then(|| decode_svg(text.as_bytes().to_vec()))
+        .flatten()
 }
 
 pub fn image_label(image: &ClipboardImage) -> String {
@@ -652,5 +717,38 @@ mod tests {
         assert_eq!((image.width, image.height), (64, 32));
         assert_eq!((image.thumbnail_width, image.thumbnail_height), (16, 8));
         assert_eq!(image.thumbnail_rgba.len(), 16 * 8 * 4);
+    }
+
+    #[test]
+    fn svg_capture_behaves_like_a_raster_image() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+            <rect width="200" height="100" fill="#33aadd"/>
+        </svg>"##;
+
+        let image = decode_image("image/svg+xml", svg.to_vec()).expect("decode test SVG");
+
+        assert!(image.is_svg);
+        assert_eq!((image.width, image.height), (200, 100));
+        assert_eq!((image.thumbnail_width, image.thumbnail_height), (16, 8));
+        assert_eq!(image.thumbnail_rgba.len(), 16 * 8 * 4);
+        assert_eq!(image.bytes.as_ref(), svg);
+    }
+
+    #[test]
+    fn detects_a_complete_svg_copied_as_plain_text() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em"
+            viewBox="0 0 24 24"><title xmlns="">a-arrow-up</title>
+            <path fill="none" stroke="currentColor" d="m14 11 4-4 4 4"/></svg>"#;
+
+        let image = detect_svg_text(svg).expect("detect SVG text");
+
+        assert!(image.is_svg);
+        assert_eq!(image.mime_type, "image/svg+xml");
+        assert_eq!(image.bytes.as_ref(), svg.as_bytes());
+    }
+
+    #[test]
+    fn does_not_treat_an_svg_fragment_as_an_image() {
+        assert!(detect_svg_text(r#"Use <svg viewBox="0 0 10 10"> here"#).is_none());
     }
 }

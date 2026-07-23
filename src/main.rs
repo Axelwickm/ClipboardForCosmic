@@ -789,7 +789,7 @@ struct HistoryItem {
     color_rgba: Option<[u8; 4]>,
     image: Option<clipboard_watcher::ClipboardImage>,
     image_handle: Option<cosmic::iced::widget::image::Handle>,
-    image_preview_handle: Option<cosmic::iced::widget::image::Handle>,
+    image_preview_handle: Option<ImagePreviewHandle>,
     captured_at: SystemTime,
     tooltip_popup_id: Id,
     tooltip_autosize_id: widget::Id,
@@ -851,9 +851,15 @@ fn record_history(
     });
     let image_preview_handle = existing_image_preview_handle.or_else(|| {
         update.image.as_ref().map(|image| {
-            cosmic::iced::widget::image::Handle::from_bytes(cosmic::iced::core::Bytes::from_owner(
-                image.bytes.clone(),
-            ))
+            if image.is_svg {
+                ImagePreviewHandle::Svg(cosmic::iced::widget::svg::Handle::from_memory(
+                    image.bytes.as_ref().to_vec(),
+                ))
+            } else {
+                ImagePreviewHandle::Raster(cosmic::iced::widget::image::Handle::from_bytes(
+                    cosmic::iced::core::Bytes::from_owner(image.bytes.clone()),
+                ))
+            }
         })
     });
     history.insert(
@@ -1076,7 +1082,13 @@ fn history_list(
 #[derive(Clone)]
 struct HistoryTooltip {
     text: String,
-    image: Option<cosmic::iced::widget::image::Handle>,
+    image: Option<ImagePreviewHandle>,
+}
+
+#[derive(Clone, Debug)]
+enum ImagePreviewHandle {
+    Raster(cosmic::iced::widget::image::Handle),
+    Svg(cosmic::iced::widget::svg::Handle),
 }
 
 fn wayland_tooltip(
@@ -1121,12 +1133,20 @@ fn wayland_tooltip(
         }),
         move || {
             let tooltip_content = if let Some(handle) = tooltip.image.clone() {
-                widget::column::with_children([widget::image(handle)
-                    .width(1920.0)
-                    .height(1080.0)
-                    .content_fit(cosmic::iced::ContentFit::Contain)
-                    .border_radius(8.0)
-                    .into()])
+                let preview: Element<'static, cosmic::Action<WindowMessage>> = match handle {
+                    ImagePreviewHandle::Raster(handle) => widget::image(handle)
+                        .width(1920.0)
+                        .height(1080.0)
+                        .content_fit(cosmic::iced::ContentFit::Contain)
+                        .border_radius(8.0)
+                        .into(),
+                    ImagePreviewHandle::Svg(handle) => widget::svg(handle)
+                        .width(1920.0)
+                        .height(1080.0)
+                        .content_fit(cosmic::iced::ContentFit::Contain)
+                        .into(),
+                };
+                widget::column::with_children([preview])
             } else {
                 widget::column::with_children([widget::text(tooltip.text.clone()).into()])
             };

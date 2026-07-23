@@ -2497,6 +2497,7 @@ dependencies = [
  "ksni",
  "libc",
  "libcosmic",
+ "resvg",
  "tokio",
  "wayland-client",
  "wayland-protocols",
