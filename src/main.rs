@@ -24,9 +24,11 @@ use tokio::sync::broadcast;
 pub(crate) const APP_ID: &str = "com.github.jax.ClipboardHistory";
 pub(crate) const APP_NAME: &str = "Clipboard History";
 pub(crate) const ICON: &[u8] = include_bytes!("../resources/clipboard-history-symbolic.svg");
+const DELETE_ICON: &[u8] = include_bytes!("../resources/delete-symbolic.svg");
 const DEFAULT_HISTORY_LIMIT: usize = 255;
 const HISTORY_PREVIEW_CHARS: usize = 100;
 const HISTORY_ROW_HEIGHT: f32 = 36.0;
+const HISTORY_ACTION_WIDTH: f32 = 40.0;
 
 fn main() {
     let command = std::env::args().nth(1);
@@ -404,6 +406,8 @@ struct ClipboardWindow {
     history: Vec<HistoryItem>,
     max_history_items: usize,
     content_window: Option<Id>,
+    closing_window: Option<Id>,
+    reopen_after_close: bool,
     content_window_focused: bool,
     selected_item: Option<usize>,
     history_scroll_id: widget::Id,
@@ -414,6 +418,7 @@ impl ClipboardWindow {
         let Some(id) = self.content_window.take() else {
             return Task::none();
         };
+        self.closing_window = Some(id);
         self.content_window_focused = false;
         cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
             destroy_window(id),
@@ -432,6 +437,7 @@ enum NavigationKey {
 enum WindowMessage {
     ClipboardUpdated(clipboard_watcher::ClipboardUpdate),
     ActivateItem(usize),
+    DeleteItem(usize),
     ClearHistory,
     ConfigureShortcut,
     Focus,
@@ -449,6 +455,7 @@ impl std::fmt::Debug for WindowMessage {
             Self::ActivateItem(index) => {
                 formatter.debug_tuple("ActivateItem").field(index).finish()
             }
+            Self::DeleteItem(index) => formatter.debug_tuple("DeleteItem").field(index).finish(),
             Self::ClearHistory => formatter.write_str("ClearHistory"),
             Self::ConfigureShortcut => formatter.write_str("ConfigureShortcut"),
             Self::Focus => formatter.write_str("Focus"),
@@ -494,6 +501,8 @@ impl cosmic::Application for ClipboardWindow {
             history: Vec::new(),
             max_history_items: DEFAULT_HISTORY_LIMIT,
             content_window: None,
+            closing_window: None,
+            reopen_after_close: false,
             content_window_focused: false,
             selected_item: None,
             history_scroll_id: widget::Id::unique(),
@@ -588,6 +597,17 @@ impl cosmic::Application for ClipboardWindow {
                 clipboard_watcher::copy_text(text);
                 return self.close_content_window();
             }
+            WindowMessage::DeleteItem(index) => {
+                if index < self.history.len() {
+                    self.history.remove(index);
+                    self.selected_item = match (self.selected_item, self.history.is_empty()) {
+                        (_, true) => None,
+                        (Some(selected), false) if selected > index => Some(selected - 1),
+                        (Some(selected), false) => Some(selected.min(self.history.len() - 1)),
+                        (None, false) => None,
+                    };
+                }
+            }
             WindowMessage::ClearHistory => {
                 self.history.clear();
                 self.selected_item = None;
@@ -611,6 +631,10 @@ impl cosmic::Application for ClipboardWindow {
             WindowMessage::Focus => {
                 if let Some(id) = self.content_window {
                     return cosmic::iced::window::gain_focus(id);
+                }
+                if self.closing_window.is_some() {
+                    self.reopen_after_close = true;
+                    return Task::none();
                 }
                 self.selected_item = (!self.history.is_empty()).then_some(0);
                 let (id, action) = app_window::<ClipboardWindow>(
@@ -644,8 +668,19 @@ impl cosmic::Application for ClipboardWindow {
             }
             WindowMessage::WindowClosed(id) => {
                 if self.content_window == Some(id) {
+                    return self.close_content_window();
+                }
+            }
+            WindowMessage::WindowEvent(id, window::Event::Closed) => {
+                if self.content_window == Some(id) {
                     self.content_window = None;
                     self.content_window_focused = false;
+                }
+                if self.closing_window == Some(id) {
+                    self.closing_window = None;
+                    if std::mem::take(&mut self.reopen_after_close) {
+                        return cosmic::task::message(cosmic::Action::App(WindowMessage::Focus));
+                    }
                 }
             }
             WindowMessage::WindowEvent(id, window::Event::Focused)
@@ -751,6 +786,8 @@ struct HistoryItem {
     mime_type: String,
     available_mime_types: Vec<String>,
     captured_at: SystemTime,
+    tooltip_popup_id: Id,
+    tooltip_autosize_id: widget::Id,
 }
 
 fn record_history(
@@ -761,7 +798,14 @@ fn record_history(
     if update.text.trim().is_empty() {
         return;
     }
-    history.retain(|entry| entry.text != update.text);
+    let tooltip_ids = history
+        .iter()
+        .position(|entry| entry.text == update.text)
+        .map(|index| {
+            let existing = history.remove(index);
+            (existing.tooltip_popup_id, existing.tooltip_autosize_id)
+        })
+        .unwrap_or_else(|| (Id::unique(), widget::Id::unique()));
     history.insert(
         0,
         HistoryItem {
@@ -769,6 +813,8 @@ fn record_history(
             mime_type: update.mime_type,
             available_mime_types: update.available_mime_types,
             captured_at: update.captured_at,
+            tooltip_popup_id: tooltip_ids.0,
+            tooltip_autosize_id: tooltip_ids.1,
         },
     );
     history.truncate(limit);
@@ -810,28 +856,87 @@ fn history_list(
             let preview = history_preview(&item.text);
             let tooltip = history_tooltip(item);
             let selected = selected_item == Some(index);
-            let button = widget::button::custom(
-                widget::row::with_children([
-                    widget::text(if selected { "›" } else { " " })
-                        .width(14.0)
-                        .into(),
-                    widget::text(preview)
-                        .width(Length::Fill)
-                        .wrapping(text::Wrapping::None)
-                        .ellipsize(text::Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
-                        .into(),
-                ])
-                .align_y(Alignment::Center),
+            let item_content = vec![
+                widget::text(if selected { "›" } else { " " })
+                    .width(14.0)
+                    .into(),
+                widget::text(preview)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::None)
+                    .ellipsize(text::Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
+                    .into(),
+                widget::Space::new()
+                    .width(HISTORY_ACTION_WIDTH + 4.0)
+                    .into(),
+            ];
+            let item_button = widget::button::custom(
+                widget::row::with_children(item_content).align_y(Alignment::Center),
             )
             .height(HISTORY_ROW_HEIGHT)
             .padding(cosmic::theme::spacing().space_xs)
             .width(Length::Fill)
             .class(cosmic::theme::Button::ListItem([0.0; 4]))
             .on_press(WindowMessage::ActivateItem(index));
+
+            let delete_icon =
+                widget::svg(cosmic::iced::widget::svg::Handle::from_memory(DELETE_ICON))
+                    .width(20.0)
+                    .height(20.0)
+                    .symbolic(true);
+            let centered_delete_icon = widget::container(delete_icon)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Center)
+                .align_y(Alignment::Center);
+            let delete_action = cosmic::iced::widget::button(centered_delete_icon)
+                .width(HISTORY_ACTION_WIDTH)
+                .height(Length::Fill)
+                .padding(0)
+                .class(cosmic::theme::iced::Button::Custom(Box::new(
+                    |_theme: &cosmic::Theme, status| {
+                        let hovered = matches!(
+                            status,
+                            cosmic::iced::widget::button::Status::Hovered
+                                | cosmic::iced::widget::button::Status::Pressed
+                        );
+                        let color = if hovered {
+                            cosmic::iced::Color::from_rgba(0.06, 0.07, 0.08, 0.58)
+                        } else {
+                            cosmic::iced::Color::TRANSPARENT
+                        };
+                        cosmic::iced::widget::button::Style {
+                            background: Some(cosmic::iced::Background::Color(color)),
+                            icon_color: Some(if hovered {
+                                cosmic::iced::Color::WHITE
+                            } else {
+                                cosmic::iced::Color::TRANSPARENT
+                            }),
+                            border: cosmic::iced::Border {
+                                radius: 8.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    },
+                )))
+                .on_press(WindowMessage::DeleteItem(index));
+            let menu_overlay = widget::container(delete_action)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding([3, 4])
+                .align_x(Horizontal::Right);
+            let row: Element<'static, WindowMessage> =
+                cosmic::iced::widget::stack([item_button.into(), menu_overlay.into()])
+                    .width(Length::Fill)
+                    .height(HISTORY_ROW_HEIGHT)
+                    .into();
+
             entries = entries.push(wayland_tooltip(
-                button,
+                row,
                 tooltip,
                 parent_window.unwrap_or(Id::RESERVED),
+                item.tooltip_popup_id,
+                item.tooltip_autosize_id.clone(),
             ));
         }
     }
@@ -845,6 +950,8 @@ fn wayland_tooltip(
     content: impl Into<Element<'static, WindowMessage>>,
     tooltip: String,
     parent: Id,
+    popup_id: Id,
+    autosize_id: widget::Id,
 ) -> Element<'static, WindowMessage> {
     use cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::{
         Anchor, Gravity,
@@ -853,8 +960,6 @@ fn wayland_tooltip(
         SctkPopupSettings, SctkPositioner,
     };
 
-    let popup_id = Id::unique();
-    let autosize_id = widget::Id::unique();
     cosmic::widget::wayland::tooltip::widget::Tooltip::<WindowMessage, WindowMessage>::new(
         content,
         Some(move |bounds: cosmic::iced::Rectangle| SctkPopupSettings {
@@ -987,6 +1092,8 @@ mod tests {
             mime_type: "text/plain".into(),
             available_mime_types: vec!["text/plain".into()],
             captured_at: SystemTime::now(),
+            tooltip_popup_id: Id::unique(),
+            tooltip_autosize_id: widget::Id::unique(),
         }
     }
 
