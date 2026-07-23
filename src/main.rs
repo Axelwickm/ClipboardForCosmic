@@ -426,6 +426,10 @@ struct ClipboardWindow {
     content_window_focused: bool,
     selected_item: Option<usize>,
     hovered_item: Option<usize>,
+    search_query: String,
+    search_results: Vec<usize>,
+    search_generation: u64,
+    search_input_id: widget::Id,
     active_generated_file: Option<std::path::PathBuf>,
     generated_files: std::collections::HashSet<std::path::PathBuf>,
     history_scroll_id: widget::Id,
@@ -439,17 +443,57 @@ impl ClipboardWindow {
         self.closing_window = Some(id);
         self.content_window_focused = false;
         self.hovered_item = None;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_generation = self.search_generation.wrapping_add(1);
         cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
             destroy_window(id),
         )))
     }
+
+    fn refresh_search(&mut self) -> Task<WindowMessage> {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        if self.search_query.is_empty() {
+            self.search_results.clear();
+            self.selected_item = (!self.history.is_empty()).then_some(0);
+            return Task::none();
+        }
+
+        let query = self.search_query.clone();
+        let searchable = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index, searchable_text(item)))
+            .collect::<Vec<_>>();
+        self.search_results.clear();
+        self.selected_item = None;
+        Task::perform(
+            async move {
+                let query = query.to_lowercase();
+                searchable
+                    .into_iter()
+                    .filter_map(|(index, text)| matches_search(&text, &query).then_some(index))
+                    .collect::<Vec<_>>()
+            },
+            move |results| {
+                cosmic::Action::App(WindowMessage::SearchCompleted {
+                    generation,
+                    results,
+                })
+            },
+        )
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum NavigationKey {
+#[derive(Clone, Debug)]
+enum KeyboardInput {
     Up,
     Down,
     Enter,
+    Escape,
+    StartSearch(String),
 }
 
 #[derive(Clone)]
@@ -468,7 +512,12 @@ enum WindowMessage {
     WindowEvent(Id, window::Event),
     SetHistoryLimit(usize),
     Surface(cosmic::surface::Action),
-    KeyboardInput(Id, NavigationKey),
+    KeyboardInput(Id, KeyboardInput),
+    SearchInput(String),
+    SearchCompleted {
+        generation: u64,
+        results: Vec<usize>,
+    },
 }
 
 impl std::fmt::Debug for WindowMessage {
@@ -506,6 +555,15 @@ impl std::fmt::Debug for WindowMessage {
                 .field(id)
                 .field(key)
                 .finish(),
+            Self::SearchInput(_) => formatter.write_str("SearchInput"),
+            Self::SearchCompleted {
+                generation,
+                results,
+            } => formatter
+                .debug_struct("SearchCompleted")
+                .field("generation", generation)
+                .field("result_count", &results.len())
+                .finish(),
         }
     }
 }
@@ -537,6 +595,10 @@ impl cosmic::Application for ClipboardWindow {
             content_window_focused: false,
             selected_item: None,
             hovered_item: None,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_generation: 0,
+            search_input_id: widget::Id::unique(),
             active_generated_file: None,
             generated_files: std::collections::HashSet::new(),
             history_scroll_id: widget::Id::unique(),
@@ -551,14 +613,7 @@ impl cosmic::Application for ClipboardWindow {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        clipboard_content(
-            &self.history,
-            self.max_history_items,
-            self.content_window,
-            self.selected_item,
-            self.hovered_item,
-            self.history_scroll_id.clone(),
-        )
+        clipboard_content(self)
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -597,20 +652,30 @@ impl cosmic::Application for ClipboardWindow {
             cosmic::iced::window::events().map(|(id, event)| WindowMessage::WindowEvent(id, event));
         let keyboard = cosmic::iced::event::listen_with(|event, _, id| {
             let cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
-                key: cosmic::iced::keyboard::Key::Named(key),
+                key,
+                modifiers,
+                text,
                 ..
             }) = event
             else {
                 return None;
             };
             use cosmic::iced::keyboard::key::Named;
-            let key = match key {
-                Named::ArrowUp => NavigationKey::Up,
-                Named::ArrowDown => NavigationKey::Down,
-                Named::Enter => NavigationKey::Enter,
+            let input = match key {
+                cosmic::iced::keyboard::Key::Named(Named::ArrowUp) => KeyboardInput::Up,
+                cosmic::iced::keyboard::Key::Named(Named::ArrowDown) => KeyboardInput::Down,
+                cosmic::iced::keyboard::Key::Named(Named::Enter) => KeyboardInput::Enter,
+                cosmic::iced::keyboard::Key::Named(Named::Escape) => KeyboardInput::Escape,
+                _ if !modifiers.control() && !modifiers.logo() => {
+                    let text = text?.to_string();
+                    if text.chars().all(char::is_control) {
+                        return None;
+                    }
+                    KeyboardInput::StartSearch(text)
+                }
                 _ => return None,
             };
-            Some(WindowMessage::KeyboardInput(id, key))
+            Some(WindowMessage::KeyboardInput(id, input))
         });
         Subscription::batch([clipboard, tray, window_events, keyboard])
     }
@@ -632,6 +697,7 @@ impl cosmic::Application for ClipboardWindow {
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
+                return self.refresh_search();
             }
             WindowMessage::ActivateItem(index) => {
                 let Some(item) =
@@ -680,6 +746,7 @@ impl cosmic::Application for ClipboardWindow {
                 );
                 self.selected_item = Some(0);
                 clipboard_watcher::copy_files(files);
+                return self.refresh_search();
             }
             WindowMessage::ConvertToData(index) => {
                 let Some(path) = self
@@ -704,6 +771,7 @@ impl cosmic::Application for ClipboardWindow {
                 {
                     self.active_generated_file = activate_clipboard_content(item);
                 }
+                return self.refresh_search();
             }
             WindowMessage::DeleteItem(index) => {
                 if index < self.history.len() {
@@ -721,6 +789,7 @@ impl cosmic::Application for ClipboardWindow {
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
+                return self.refresh_search();
             }
             WindowMessage::HoverItem(index) => {
                 self.hovered_item = index.filter(|index| *index < self.history.len());
@@ -733,6 +802,7 @@ impl cosmic::Application for ClipboardWindow {
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
+                return self.refresh_search();
             }
             WindowMessage::Shutdown => {
                 report_temp_cleanup(
@@ -781,15 +851,7 @@ impl cosmic::Application for ClipboardWindow {
                         ..window::Settings::default()
                     },
                     Some(Box::new(|state| {
-                        clipboard_content(
-                            &state.history,
-                            state.max_history_items,
-                            state.content_window,
-                            state.selected_item,
-                            state.hovered_item,
-                            state.history_scroll_id.clone(),
-                        )
-                        .map(cosmic::Action::App)
+                        clipboard_content(state).map(cosmic::Action::App)
                     })),
                 );
                 self.content_window = Some(id);
@@ -819,6 +881,12 @@ impl cosmic::Application for ClipboardWindow {
                 if self.content_window == Some(id) =>
             {
                 self.content_window_focused = true;
+                return widget::text_input::focus(self.search_input_id.clone());
+            }
+            WindowMessage::WindowEvent(id, window::Event::Opened { .. })
+                if self.content_window == Some(id) =>
+            {
+                return widget::text_input::focus(self.search_input_id.clone());
             }
             WindowMessage::WindowEvent(id, window::Event::Unfocused)
                 if self.content_window == Some(id) && self.content_window_focused =>
@@ -838,6 +906,7 @@ impl cosmic::Application for ClipboardWindow {
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
+                return self.refresh_search();
             }
             WindowMessage::Surface(action) => {
                 return cosmic::task::message(cosmic::Action::Cosmic(
@@ -845,13 +914,39 @@ impl cosmic::Application for ClipboardWindow {
                 ));
             }
             WindowMessage::KeyboardInput(id, key) if self.content_window == Some(id) => {
-                if self.history.is_empty() {
+                match key {
+                    KeyboardInput::StartSearch(text) if self.search_query.is_empty() => {
+                        self.search_query = text;
+                        return Task::batch(vec![
+                            self.refresh_search(),
+                            widget::text_input::focus(self.search_input_id.clone()),
+                        ]);
+                    }
+                    KeyboardInput::StartSearch(_) => return Task::none(),
+                    KeyboardInput::Escape if !self.search_query.is_empty() => {
+                        self.search_query.clear();
+                        return self.refresh_search();
+                    }
+                    KeyboardInput::Escape => return self.close_content_window(),
+                    _ => {}
+                }
+
+                let visible = if self.search_query.is_empty() {
+                    (0..self.history.len()).collect::<Vec<_>>()
+                } else {
+                    self.search_results.clone()
+                };
+                if visible.is_empty() {
                     self.selected_item = None;
                     return Task::none();
                 }
-                let current = self.selected_item.unwrap_or(0).min(self.history.len() - 1);
+                let current_position = self
+                    .selected_item
+                    .and_then(|selected| visible.iter().position(|index| *index == selected))
+                    .unwrap_or(0);
                 match key {
-                    NavigationKey::Enter => {
+                    KeyboardInput::Enter => {
+                        let current = visible[current_position];
                         let item = activate_history_item(
                             &mut self.history,
                             &mut self.selected_item,
@@ -861,19 +956,27 @@ impl cosmic::Application for ClipboardWindow {
                         self.active_generated_file = activate_clipboard_content(item);
                         return self.close_content_window();
                     }
-                    NavigationKey::Up => {
-                        self.selected_item = Some(if current == 0 {
-                            self.history.len() - 1
+                    KeyboardInput::Up => {
+                        let position = if current_position == 0 {
+                            visible.len() - 1
                         } else {
-                            current - 1
-                        });
+                            current_position - 1
+                        };
+                        self.selected_item = Some(visible[position]);
                     }
-                    NavigationKey::Down => {
-                        self.selected_item = Some((current + 1) % self.history.len());
+                    KeyboardInput::Down => {
+                        self.selected_item = Some(visible[(current_position + 1) % visible.len()]);
+                    }
+                    KeyboardInput::Escape | KeyboardInput::StartSearch(_) => {
+                        unreachable!("search input handled before navigation")
                     }
                 }
-                let offset = self.selected_item.unwrap() as f32
-                    / self.history.len().saturating_sub(1).max(1) as f32;
+                let selected_position = visible
+                    .iter()
+                    .position(|index| Some(*index) == self.selected_item)
+                    .unwrap_or(0);
+                let offset =
+                    selected_position as f32 / visible.len().saturating_sub(1).max(1) as f32;
                 return cosmic::iced::widget::scrollable::snap_to(
                     self.history_scroll_id.clone(),
                     cosmic::iced::widget::scrollable::RelativeOffset {
@@ -883,23 +986,36 @@ impl cosmic::Application for ClipboardWindow {
                 );
             }
             WindowMessage::KeyboardInput(_, _) => {}
+            WindowMessage::SearchInput(query) => {
+                self.search_query = query;
+                return self.refresh_search();
+            }
+            WindowMessage::SearchCompleted {
+                generation,
+                results,
+            } => {
+                if generation == self.search_generation {
+                    self.search_results = results;
+                    self.selected_item = self.search_results.first().copied();
+                    return cosmic::iced::widget::scrollable::snap_to(
+                        self.history_scroll_id.clone(),
+                        cosmic::iced::widget::scrollable::RelativeOffset {
+                            x: None,
+                            y: Some(0.0),
+                        },
+                    );
+                }
+            }
         }
         Task::none()
     }
 }
 
-fn clipboard_content(
-    history: &[HistoryItem],
-    max_history_items: usize,
-    parent_window: Option<Id>,
-    selected_item: Option<usize>,
-    hovered_item: Option<usize>,
-    history_scroll_id: widget::Id,
-) -> Element<'static, WindowMessage> {
+fn clipboard_content(state: &ClipboardWindow) -> Element<'static, WindowMessage> {
     let status_bar = widget::container(widget::text(format!(
         "{}/{} items",
-        history.len(),
-        max_history_items
+        state.history.len(),
+        state.max_history_items
     )))
     .height(28.0)
     .padding(cosmic::theme::spacing().space_s)
@@ -907,22 +1023,42 @@ fn clipboard_content(
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    widget::container(
-        widget::column::with_children([
-            history_list(
-                history,
-                parent_window,
-                selected_item,
-                hovered_item,
-                history_scroll_id,
-            ),
-            status_bar.into(),
-        ])
-        .height(Length::Fill),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    let visible_indices = if state.search_query.is_empty() {
+        (0..state.history.len()).collect::<Vec<_>>()
+    } else {
+        state.search_results.clone()
+    };
+    let search = widget::text_input::inline_input("", state.search_query.clone())
+        .id(state.search_input_id.clone())
+        .on_input(WindowMessage::SearchInput)
+        .leading_icon(
+            widget::icon::from_name("system-search-symbolic")
+                .size(16)
+                .icon()
+                .into(),
+        )
+        .width(Length::Fill);
+    let searching = !state.search_query.is_empty();
+    let mut content = widget::column::with_capacity(3).height(Length::Fill).push(
+        widget::container(search)
+            .height(if searching { 34.0 } else { 0.0 })
+            .padding(if searching { [3, 8] } else { [0, 0] })
+            .width(Length::Fill),
+    );
+    content = content.push(history_list(
+        &state.history,
+        &visible_indices,
+        state.content_window,
+        state.selected_item,
+        state.hovered_item,
+        state.history_scroll_id.clone(),
+    ));
+    content = content.push(status_bar);
+
+    widget::container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 #[derive(Clone, Debug)]
@@ -1238,21 +1374,30 @@ fn materialize_history_item(
 
 fn history_list(
     history: &[HistoryItem],
+    visible_indices: &[usize],
     parent_window: Option<Id>,
     selected_item: Option<usize>,
     hovered_item: Option<usize>,
     history_scroll_id: widget::Id,
 ) -> Element<'static, WindowMessage> {
     let mut entries = widget::column::with_capacity(0).spacing(cosmic::theme::spacing().space_xs);
-    if history.is_empty() {
-        return widget::container(widget::text("No clipboard items yet."))
+    if visible_indices.is_empty() {
+        let empty_message = if history.is_empty() {
+            "No clipboard items yet."
+        } else {
+            "No matches."
+        };
+        return widget::container(widget::text(empty_message))
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Horizontal::Center)
             .align_y(Alignment::Center)
             .into();
     } else {
-        for (index, item) in history.iter().enumerate() {
+        for &index in visible_indices {
+            let Some(item) = history.get(index) else {
+                continue;
+            };
             let preview = history_preview(&item.text);
             let tooltip = history_tooltip(item);
             let selected = selected_item == Some(index);
@@ -1730,6 +1875,35 @@ fn history_preview(value: &str) -> String {
     preview
 }
 
+fn searchable_text(item: &HistoryItem) -> String {
+    let mut searchable = String::with_capacity(item.text.len() + 96);
+    searchable.push_str(&item.text);
+    searchable.push(' ');
+    searchable.push_str(&item.mime_type);
+    for mime_type in &item.available_mime_types {
+        searchable.push(' ');
+        searchable.push_str(mime_type);
+    }
+    if let Some(image) = &item.image {
+        searchable.push_str(&format!(" {}x{} image", image.width, image.height));
+    }
+    if let Some(files) = &item.files {
+        for entry in &files.entries {
+            searchable.push(' ');
+            searchable.push_str(&entry.uri);
+            if let Some(path) = &entry.path {
+                searchable.push(' ');
+                searchable.push_str(&path.to_string_lossy());
+            }
+        }
+    }
+    searchable
+}
+
+fn matches_search(searchable: &str, lowercase_query: &str) -> bool {
+    searchable.to_lowercase().contains(lowercase_query)
+}
+
 const HISTORY_LIMIT_OPTIONS: [usize; 5] = [50, 100, DEFAULT_HISTORY_LIMIT, 500, 1_000];
 
 #[cfg(test)]
@@ -1787,5 +1961,16 @@ mod tests {
         assert!(activate_history_item(&mut history, &mut selected, 4).is_none());
         assert_eq!(selected, Some(0));
         assert_eq!(history[0].text, "only");
+    }
+
+    #[test]
+    fn search_matches_text_and_metadata_without_case_sensitivity() {
+        let mut entry = item("A Useful Snippet");
+        entry.mime_type = "application/example".into();
+        let searchable = searchable_text(&entry);
+
+        assert!(matches_search(&searchable, "useful"));
+        assert!(matches_search(&searchable, "application/example"));
+        assert!(!matches_search(&searchable, "missing"));
     }
 }
