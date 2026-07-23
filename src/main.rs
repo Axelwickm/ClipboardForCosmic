@@ -16,7 +16,8 @@ use cosmic::widget;
 use fs2::FileExt;
 use ksni::blocking::TrayMethods;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
+use std::path::Path;
 use std::time::Duration;
 use std::time::SystemTime;
 use tokio::sync::broadcast;
@@ -25,10 +26,14 @@ pub(crate) const APP_ID: &str = "com.github.jax.ClipboardHistory";
 pub(crate) const APP_NAME: &str = "Clipboard History";
 pub(crate) const ICON: &[u8] = include_bytes!("../resources/clipboard-history-symbolic.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../resources/delete-symbolic.svg");
+const TO_FILE_ICON: &[u8] = include_bytes!("../resources/to-file-symbolic.svg");
+const TO_DATA_ICON: &[u8] = include_bytes!("../resources/to-data-symbolic.svg");
 const DEFAULT_HISTORY_LIMIT: usize = 255;
 const HISTORY_PREVIEW_CHARS: usize = 100;
 const HISTORY_ROW_HEIGHT: f32 = 36.0;
 const HISTORY_ACTION_WIDTH: f32 = 40.0;
+const TO_FILE_ACTION_WIDTH: f32 = 36.0;
+const TO_DATA_ACTION_WIDTH: f32 = 36.0;
 
 fn main() {
     let command = std::env::args().nth(1);
@@ -65,6 +70,9 @@ fn launch() {
         eprintln!("{APP_NAME} is already running.");
         return;
     };
+    if let Err(error) = cleanup_stale_temp_files() {
+        eprintln!("{APP_NAME}: could not clean stale temporary files: {error}");
+    }
 
     start_tray();
     start_control_socket();
@@ -131,6 +139,7 @@ fn start_control_socket() {
 #[derive(Clone, Copy)]
 enum TrayEvent {
     Activate,
+    Shutdown,
     ClearHistory,
     ConfigureShortcut,
     SetHistoryLimit(usize),
@@ -180,7 +189,12 @@ impl ksni::Tray for TrayIcon {
         vec![
             ksni::menu::StandardItem {
                 label: "Shutdown".into(),
-                activate: Box::new(|_| std::process::exit(0)),
+                activate: Box::new(|_| {
+                    let _ = TRAY_EVENTS
+                        .get()
+                        .expect("tray sender")
+                        .send(TrayEvent::Shutdown);
+                }),
                 ..Default::default()
             }
             .into(),
@@ -411,6 +425,9 @@ struct ClipboardWindow {
     reopen_after_close: bool,
     content_window_focused: bool,
     selected_item: Option<usize>,
+    hovered_item: Option<usize>,
+    active_generated_file: Option<std::path::PathBuf>,
+    generated_files: std::collections::HashSet<std::path::PathBuf>,
     history_scroll_id: widget::Id,
 }
 
@@ -421,6 +438,7 @@ impl ClipboardWindow {
         };
         self.closing_window = Some(id);
         self.content_window_focused = false;
+        self.hovered_item = None;
         cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
             destroy_window(id),
         )))
@@ -438,8 +456,12 @@ enum NavigationKey {
 enum WindowMessage {
     ClipboardUpdated(clipboard_watcher::ClipboardUpdate),
     ActivateItem(usize),
+    ConvertToData(usize),
+    ConvertToFile(usize),
     DeleteItem(usize),
+    HoverItem(Option<usize>),
     ClearHistory,
+    Shutdown,
     ConfigureShortcut,
     Focus,
     WindowClosed(Id),
@@ -456,8 +478,16 @@ impl std::fmt::Debug for WindowMessage {
             Self::ActivateItem(index) => {
                 formatter.debug_tuple("ActivateItem").field(index).finish()
             }
+            Self::ConvertToData(index) => {
+                formatter.debug_tuple("ConvertToData").field(index).finish()
+            }
+            Self::ConvertToFile(index) => {
+                formatter.debug_tuple("ConvertToFile").field(index).finish()
+            }
             Self::DeleteItem(index) => formatter.debug_tuple("DeleteItem").field(index).finish(),
+            Self::HoverItem(index) => formatter.debug_tuple("HoverItem").field(index).finish(),
             Self::ClearHistory => formatter.write_str("ClearHistory"),
+            Self::Shutdown => formatter.write_str("Shutdown"),
             Self::ConfigureShortcut => formatter.write_str("ConfigureShortcut"),
             Self::Focus => formatter.write_str("Focus"),
             Self::WindowClosed(id) => formatter.debug_tuple("WindowClosed").field(id).finish(),
@@ -506,6 +536,9 @@ impl cosmic::Application for ClipboardWindow {
             reopen_after_close: false,
             content_window_focused: false,
             selected_item: None,
+            hovered_item: None,
+            active_generated_file: None,
+            generated_files: std::collections::HashSet::new(),
             history_scroll_id: widget::Id::unique(),
         };
         app.core.window.show_minimize = false;
@@ -523,6 +556,7 @@ impl cosmic::Application for ClipboardWindow {
             self.max_history_items,
             self.content_window,
             self.selected_item,
+            self.hovered_item,
             self.history_scroll_id.clone(),
         )
     }
@@ -547,6 +581,7 @@ impl cosmic::Application for ClipboardWindow {
                     while let Ok(event) = events.recv().await {
                         let message = match event {
                             TrayEvent::Activate => WindowMessage::Focus,
+                            TrayEvent::Shutdown => WindowMessage::Shutdown,
                             TrayEvent::ClearHistory => WindowMessage::ClearHistory,
                             TrayEvent::ConfigureShortcut => WindowMessage::ConfigureShortcut,
                             TrayEvent::SetHistoryLimit(limit) => {
@@ -586,8 +621,17 @@ impl cosmic::Application for ClipboardWindow {
                 if !update.text.trim().is_empty() {
                     flash_tray_icon();
                 }
+                self.active_generated_file = self
+                    .active_generated_file
+                    .take()
+                    .filter(|path| clipboard_update_contains_path(&update, path));
                 record_history(&mut self.history, update, self.max_history_items);
                 self.selected_item = (!self.history.is_empty()).then_some(0);
+                report_temp_cleanup(
+                    &self.history,
+                    self.active_generated_file.as_deref(),
+                    &mut self.generated_files,
+                );
             }
             WindowMessage::ActivateItem(index) => {
                 let Some(item) =
@@ -595,8 +639,71 @@ impl cosmic::Application for ClipboardWindow {
                 else {
                     return Task::none();
                 };
-                activate_clipboard_content(item);
+                self.active_generated_file = activate_clipboard_content(item);
                 return self.close_content_window();
+            }
+            WindowMessage::ConvertToFile(index) => {
+                let Some(item) = self.history.get(index) else {
+                    return Task::none();
+                };
+                if item.files.is_some() {
+                    return Task::none();
+                }
+                let files = match materialize_history_item(item) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        eprintln!(
+                            "{APP_NAME}: could not convert clipboard item to a file: {error}"
+                        );
+                        return Task::none();
+                    }
+                };
+                let label = clipboard_watcher::files_label(&files);
+                self.active_generated_file = generated_path(&files);
+                self.generated_files
+                    .extend(self.active_generated_file.iter().cloned());
+                record_history(
+                    &mut self.history,
+                    clipboard_watcher::ClipboardUpdate {
+                        text: label,
+                        mime_type: "text/uri-list".into(),
+                        available_mime_types: vec![
+                            "text/uri-list".into(),
+                            "x-special/gnome-copied-files".into(),
+                        ],
+                        color_rgba: None,
+                        image: None,
+                        files: Some(files.clone()),
+                        captured_at: SystemTime::now(),
+                    },
+                    self.max_history_items,
+                );
+                self.selected_item = Some(0);
+                clipboard_watcher::copy_files(files);
+            }
+            WindowMessage::ConvertToData(index) => {
+                let Some(path) = self
+                    .history
+                    .get(index)
+                    .and_then(|item| item.files.as_ref())
+                    .and_then(single_regular_file_path)
+                    .map(Path::to_path_buf)
+                else {
+                    return Task::none();
+                };
+                let update = match clipboard_watcher::read_file_as_clipboard_update(&path) {
+                    Ok(update) => update,
+                    Err(error) => {
+                        eprintln!("{APP_NAME}: could not convert clipboard file to data: {error}");
+                        return Task::none();
+                    }
+                };
+                record_history(&mut self.history, update, self.max_history_items);
+                if let Some(item) =
+                    activate_history_item(&mut self.history, &mut self.selected_item, 0)
+                {
+                    self.active_generated_file = activate_clipboard_content(item);
+                }
             }
             WindowMessage::DeleteItem(index) => {
                 if index < self.history.len() {
@@ -608,10 +715,32 @@ impl cosmic::Application for ClipboardWindow {
                         (None, false) => None,
                     };
                 }
+                self.hovered_item = None;
+                report_temp_cleanup(
+                    &self.history,
+                    self.active_generated_file.as_deref(),
+                    &mut self.generated_files,
+                );
+            }
+            WindowMessage::HoverItem(index) => {
+                self.hovered_item = index.filter(|index| *index < self.history.len());
             }
             WindowMessage::ClearHistory => {
                 self.history.clear();
                 self.selected_item = None;
+                report_temp_cleanup(
+                    &self.history,
+                    self.active_generated_file.as_deref(),
+                    &mut self.generated_files,
+                );
+            }
+            WindowMessage::Shutdown => {
+                report_temp_cleanup(
+                    &self.history,
+                    self.active_generated_file.as_deref(),
+                    &mut self.generated_files,
+                );
+                std::process::exit(0);
             }
             WindowMessage::ConfigureShortcut => {
                 let command = match bin_management::show_command() {
@@ -638,6 +767,7 @@ impl cosmic::Application for ClipboardWindow {
                     return Task::none();
                 }
                 self.selected_item = (!self.history.is_empty()).then_some(0);
+                self.hovered_item = None;
                 let (id, action) = app_window::<ClipboardWindow>(
                     |_| Default::default(),
                     |_| window::Settings {
@@ -656,6 +786,7 @@ impl cosmic::Application for ClipboardWindow {
                             state.max_history_items,
                             state.content_window,
                             state.selected_item,
+                            state.hovered_item,
                             state.history_scroll_id.clone(),
                         )
                         .map(cosmic::Action::App)
@@ -692,6 +823,7 @@ impl cosmic::Application for ClipboardWindow {
             WindowMessage::WindowEvent(id, window::Event::Unfocused)
                 if self.content_window == Some(id) && self.content_window_focused =>
             {
+                self.hovered_item = None;
                 return self.close_content_window();
             }
             WindowMessage::WindowEvent(_, _) => {}
@@ -701,6 +833,11 @@ impl cosmic::Application for ClipboardWindow {
                 self.selected_item = self
                     .selected_item
                     .filter(|index| *index < self.history.len());
+                report_temp_cleanup(
+                    &self.history,
+                    self.active_generated_file.as_deref(),
+                    &mut self.generated_files,
+                );
             }
             WindowMessage::Surface(action) => {
                 return cosmic::task::message(cosmic::Action::Cosmic(
@@ -721,7 +858,7 @@ impl cosmic::Application for ClipboardWindow {
                             current,
                         )
                         .expect("validated history index");
-                        activate_clipboard_content(item);
+                        self.active_generated_file = activate_clipboard_content(item);
                         return self.close_content_window();
                     }
                     NavigationKey::Up => {
@@ -756,6 +893,7 @@ fn clipboard_content(
     max_history_items: usize,
     parent_window: Option<Id>,
     selected_item: Option<usize>,
+    hovered_item: Option<usize>,
     history_scroll_id: widget::Id,
 ) -> Element<'static, WindowMessage> {
     let status_bar = widget::container(widget::text(format!(
@@ -771,7 +909,13 @@ fn clipboard_content(
 
     widget::container(
         widget::column::with_children([
-            history_list(history, parent_window, selected_item, history_scroll_id),
+            history_list(
+                history,
+                parent_window,
+                selected_item,
+                hovered_item,
+                history_scroll_id,
+            ),
             status_bar.into(),
         ])
         .height(Length::Fill),
@@ -788,6 +932,7 @@ struct HistoryItem {
     available_mime_types: Vec<String>,
     color_rgba: Option<[u8; 4]>,
     image: Option<clipboard_watcher::ClipboardImage>,
+    files: Option<clipboard_watcher::ClipboardFiles>,
     image_handle: Option<cosmic::iced::widget::image::Handle>,
     image_preview_handle: Option<ImagePreviewHandle>,
     captured_at: SystemTime,
@@ -795,6 +940,17 @@ struct HistoryItem {
     tooltip_autosize_id: widget::Id,
     preview_popup_id: Id,
     preview_autosize_id: widget::Id,
+    to_file_popup_id: Id,
+    to_file_autosize_id: widget::Id,
+    to_data_popup_id: Id,
+    to_data_autosize_id: widget::Id,
+}
+
+fn single_regular_file_path(files: &clipboard_watcher::ClipboardFiles) -> Option<&Path> {
+    match files.entries.as_slice() {
+        [entry] if !entry.is_dir => entry.path.as_deref(),
+        _ => None,
+    }
 }
 
 fn record_history(
@@ -807,11 +963,14 @@ fn record_history(
     }
     let existing = history
         .iter()
-        .position(|entry| match (&entry.image, &update.image) {
-            (Some(existing), Some(incoming)) => existing.bytes == incoming.bytes,
-            (None, None) => entry.text == update.text,
-            _ => false,
-        })
+        .position(
+            |entry| match (&entry.image, &update.image, &entry.files, &update.files) {
+                (Some(existing), Some(incoming), _, _) => existing.bytes == incoming.bytes,
+                (None, None, Some(existing), Some(incoming)) => existing == incoming,
+                (None, None, None, None) => entry.text == update.text,
+                _ => false,
+            },
+        )
         .map(|index| {
             let existing = history.remove(index);
             (
@@ -819,6 +978,10 @@ fn record_history(
                 existing.tooltip_autosize_id,
                 existing.preview_popup_id,
                 existing.preview_autosize_id,
+                existing.to_file_popup_id,
+                existing.to_file_autosize_id,
+                existing.to_data_popup_id,
+                existing.to_data_autosize_id,
                 existing.image_handle,
                 existing.image_preview_handle,
             )
@@ -828,10 +991,18 @@ fn record_history(
         tooltip_autosize_id,
         preview_popup_id,
         preview_autosize_id,
+        to_file_popup_id,
+        to_file_autosize_id,
+        to_data_popup_id,
+        to_data_autosize_id,
         existing_image_handle,
         existing_image_preview_handle,
     ) = existing.unwrap_or_else(|| {
         (
+            Id::unique(),
+            widget::Id::unique(),
+            Id::unique(),
+            widget::Id::unique(),
             Id::unique(),
             widget::Id::unique(),
             Id::unique(),
@@ -870,6 +1041,7 @@ fn record_history(
             available_mime_types: update.available_mime_types,
             color_rgba: update.color_rgba,
             image: update.image,
+            files: update.files,
             image_handle,
             image_preview_handle,
             captured_at: update.captured_at,
@@ -877,6 +1049,10 @@ fn record_history(
             tooltip_autosize_id,
             preview_popup_id,
             preview_autosize_id,
+            to_file_popup_id,
+            to_file_autosize_id,
+            to_data_popup_id,
+            to_data_autosize_id,
         },
     );
     history.truncate(limit);
@@ -897,6 +1073,7 @@ fn activate_history_item(
         text: item.text.clone(),
         color_rgba: item.color_rgba,
         image: item.image.clone(),
+        files: item.files.clone(),
     };
     history.insert(0, item);
     *selected_item = Some(0);
@@ -907,25 +1084,168 @@ struct ActivatedClipboardItem {
     text: String,
     color_rgba: Option<[u8; 4]>,
     image: Option<clipboard_watcher::ClipboardImage>,
+    files: Option<clipboard_watcher::ClipboardFiles>,
 }
 
-fn activate_clipboard_content(item: ActivatedClipboardItem) {
+fn activate_clipboard_content(item: ActivatedClipboardItem) -> Option<std::path::PathBuf> {
     if let Some(image) = item.image {
         clipboard_watcher::copy_image(image);
+        None
+    } else if let Some(files) = item.files {
+        let generated = generated_path(&files);
+        clipboard_watcher::copy_files(files);
+        generated
     } else {
         clipboard_watcher::copy_text_with_color(item.text, item.color_rgba);
+        None
     }
+}
+
+const TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn temp_storage_dir() -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let path = std::path::PathBuf::from("/tmp/jax-clipboard-history");
+    match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "temporary storage path is not a real directory",
+        ));
+    }
+    // SAFETY: `geteuid` has no preconditions and does not retain state.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "temporary storage directory belongs to another user",
+        ));
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    Ok(path)
+}
+
+fn cleanup_stale_temp_files() -> io::Result<()> {
+    let directory = temp_storage_dir()?;
+    let now = SystemTime::now();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= TEMP_FILE_MAX_AGE);
+        if stale && (metadata.is_file() || metadata.file_type().is_symlink()) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn generated_path(files: &clipboard_watcher::ClipboardFiles) -> Option<std::path::PathBuf> {
+    let directory = std::path::Path::new("/tmp/jax-clipboard-history");
+    files.entries.iter().find_map(|entry| {
+        entry
+            .path
+            .as_ref()
+            .filter(|path| path.parent() == Some(directory))
+            .cloned()
+    })
+}
+
+fn clipboard_update_contains_path(
+    update: &clipboard_watcher::ClipboardUpdate,
+    path: &std::path::Path,
+) -> bool {
+    update.files.as_ref().is_some_and(|files| {
+        files
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_deref() == Some(path))
+    })
+}
+
+fn report_temp_cleanup(
+    history: &[HistoryItem],
+    active: Option<&std::path::Path>,
+    generated: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    if let Err(error) = cleanup_unreferenced_temp_files(history, active, generated) {
+        eprintln!("{APP_NAME}: could not clean temporary files: {error}");
+    }
+}
+
+fn cleanup_unreferenced_temp_files(
+    history: &[HistoryItem],
+    active: Option<&std::path::Path>,
+    generated: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> io::Result<()> {
+    let mut referenced = history
+        .iter()
+        .filter_map(|item| item.files.as_ref())
+        .flat_map(|files| files.entries.iter())
+        .filter_map(|entry| entry.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    referenced.extend(active.map(std::path::Path::to_path_buf));
+    let unreferenced = generated
+        .iter()
+        .filter(|path| !referenced.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in unreferenced {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        generated.remove(&path);
+    }
+    Ok(())
+}
+
+fn materialize_history_item(
+    item: &HistoryItem,
+) -> Result<clipboard_watcher::ClipboardFiles, Box<dyn std::error::Error>> {
+    let (bytes, suffix): (&[u8], &str) = if let Some(image) = &item.image {
+        let suffix = match image.mime_type.as_str() {
+            "image/png" => ".png",
+            "image/jpeg" | "image/jpg" => ".jpg",
+            "image/webp" => ".webp",
+            "image/gif" => ".gif",
+            "image/bmp" | "image/x-bmp" => ".bmp",
+            "image/tiff" => ".tiff",
+            "image/svg+xml" => ".svg",
+            _ => ".img",
+        };
+        (image.bytes.as_ref(), suffix)
+    } else {
+        (item.text.as_bytes(), ".txt")
+    };
+    let mut temporary = tempfile::Builder::new()
+        .prefix("jax-clipboard-")
+        .suffix(suffix)
+        .tempfile_in(temp_storage_dir()?)?;
+    temporary.write_all(bytes)?;
+    temporary.flush()?;
+    let (_, path) = temporary.keep().map_err(|error| error.error)?;
+    Ok(clipboard_watcher::file_reference(&path)?)
 }
 
 fn history_list(
     history: &[HistoryItem],
     parent_window: Option<Id>,
     selected_item: Option<usize>,
+    hovered_item: Option<usize>,
     history_scroll_id: widget::Id,
 ) -> Element<'static, WindowMessage> {
     let mut entries = widget::column::with_capacity(0).spacing(cosmic::theme::spacing().space_xs);
     if history.is_empty() {
-        return widget::container(widget::text("No text copied yet."))
+        return widget::container(widget::text("No clipboard items yet."))
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Horizontal::Center)
@@ -936,6 +1256,20 @@ fn history_list(
             let preview = history_preview(&item.text);
             let tooltip = history_tooltip(item);
             let selected = selected_item == Some(index);
+            let row_hovered = hovered_item == Some(index);
+            let can_convert_to_data = item
+                .files
+                .as_ref()
+                .and_then(single_regular_file_path)
+                .is_some();
+            let action_width = HISTORY_ACTION_WIDTH
+                + if item.files.is_none() {
+                    TO_FILE_ACTION_WIDTH
+                } else if can_convert_to_data {
+                    TO_DATA_ACTION_WIDTH
+                } else {
+                    0.0
+                };
             let mut item_content = vec![
                 widget::text(if selected { "›" } else { " " })
                     .width(14.0)
@@ -958,11 +1292,20 @@ fn history_list(
                         parent_window.unwrap_or(Id::RESERVED),
                         item.preview_popup_id,
                         item.preview_autosize_id.clone(),
+                        false,
                     )
                 } else {
                     thumbnail
                 };
                 item_content.push(thumbnail);
+                item_content.push(widget::Space::new().width(6.0).into());
+            } else if let Some(files) = &item.files {
+                let icon_name = if files.entries.iter().all(|entry| entry.is_dir) {
+                    "folder-symbolic"
+                } else {
+                    "text-x-generic-symbolic"
+                };
+                item_content.push(widget::icon::from_name(icon_name).size(16).icon().into());
                 item_content.push(widget::Space::new().width(6.0).into());
             } else if let Some(rgba) = item.color_rgba {
                 let [red, green, blue, alpha] = rgba;
@@ -998,9 +1341,7 @@ fn history_list(
                     .wrapping(text::Wrapping::None)
                     .ellipsize(text::Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
                     .into(),
-                widget::Space::new()
-                    .width(HISTORY_ACTION_WIDTH + 4.0)
-                    .into(),
+                widget::Space::new().width(action_width + 4.0).into(),
             ]);
             let item_button = widget::button::custom(
                 widget::row::with_children(item_content).align_y(Alignment::Center),
@@ -1011,71 +1352,163 @@ fn history_list(
             .class(cosmic::theme::Button::ListItem([0.0; 4]))
             .on_press(WindowMessage::ActivateItem(index));
 
-            let delete_icon =
-                widget::svg(cosmic::iced::widget::svg::Handle::from_memory(DELETE_ICON))
-                    .width(20.0)
-                    .height(20.0)
-                    .symbolic(true);
-            let centered_delete_icon = widget::container(delete_icon)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Horizontal::Center)
-                .align_y(Alignment::Center);
-            let delete_action = cosmic::iced::widget::button(centered_delete_icon)
-                .width(HISTORY_ACTION_WIDTH)
-                .height(Length::Fill)
-                .padding(0)
-                .class(cosmic::theme::iced::Button::Custom(Box::new(
-                    |_theme: &cosmic::Theme, status| {
-                        let hovered = matches!(
-                            status,
-                            cosmic::iced::widget::button::Status::Hovered
-                                | cosmic::iced::widget::button::Status::Pressed
-                        );
-                        let color = if hovered {
-                            cosmic::iced::Color::from_rgba(0.06, 0.07, 0.08, 0.58)
-                        } else {
-                            cosmic::iced::Color::TRANSPARENT
-                        };
-                        cosmic::iced::widget::button::Style {
-                            background: Some(cosmic::iced::Background::Color(color)),
-                            icon_color: Some(if hovered {
-                                cosmic::iced::Color::WHITE
-                            } else {
-                                cosmic::iced::Color::TRANSPARENT
-                            }),
-                            border: cosmic::iced::Border {
-                                radius: 8.0.into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }
+            let mut actions = Vec::with_capacity(2);
+            if item.files.is_none() {
+                let to_file = hover_action(
+                    TO_FILE_ICON,
+                    WindowMessage::ConvertToFile(index),
+                    TO_FILE_ACTION_WIDTH,
+                    row_hovered,
+                );
+                let to_file = wayland_tooltip(
+                    to_file,
+                    HistoryTooltip {
+                        text: "To file".into(),
+                        image: None,
                     },
-                )))
-                .on_press(WindowMessage::DeleteItem(index));
-            let menu_overlay = widget::container(delete_action)
+                    parent_window.unwrap_or(Id::RESERVED),
+                    item.to_file_popup_id,
+                    item.to_file_autosize_id.clone(),
+                    false,
+                );
+                actions.push(
+                    widget::container(to_file)
+                        .width(TO_FILE_ACTION_WIDTH)
+                        .height(Length::Fill)
+                        .align_x(Horizontal::Center)
+                        .align_y(Alignment::Center)
+                        .into(),
+                );
+            } else if can_convert_to_data {
+                let to_data = hover_action(
+                    TO_DATA_ICON,
+                    WindowMessage::ConvertToData(index),
+                    TO_DATA_ACTION_WIDTH,
+                    row_hovered,
+                );
+                let to_data = wayland_tooltip(
+                    to_data,
+                    HistoryTooltip {
+                        text: "To data".into(),
+                        image: None,
+                    },
+                    parent_window.unwrap_or(Id::RESERVED),
+                    item.to_data_popup_id,
+                    item.to_data_autosize_id.clone(),
+                    false,
+                );
+                actions.push(
+                    widget::container(to_data)
+                        .width(TO_DATA_ACTION_WIDTH)
+                        .height(Length::Fill)
+                        .align_x(Horizontal::Center)
+                        .align_y(Alignment::Center)
+                        .into(),
+                );
+            }
+            actions.push(hover_action(
+                DELETE_ICON,
+                WindowMessage::DeleteItem(index),
+                HISTORY_ACTION_WIDTH,
+                row_hovered,
+            ));
+            let action_panel = widget::container(
+                widget::row::with_children(actions)
+                    .width(action_width)
+                    .height(Length::Fill),
+            )
+            .width(action_width)
+            .height(Length::Fill)
+            .class(cosmic::theme::Container::custom(move |_| {
+                widget::container::Style {
+                    background: row_hovered.then_some(cosmic::iced::Background::Color(
+                        cosmic::iced::Color::from_rgba(0.06, 0.07, 0.08, 0.42),
+                    )),
+                    border: cosmic::iced::Border {
+                        radius: 8.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            }));
+            let menu_overlay = widget::container(action_panel)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .padding([3, 4])
+                .padding([3, 0])
                 .align_x(Horizontal::Right);
             let row: Element<'static, WindowMessage> =
                 cosmic::iced::widget::stack([item_button.into(), menu_overlay.into()])
                     .width(Length::Fill)
                     .height(HISTORY_ROW_HEIGHT)
                     .into();
+            let hoverable = widget::mouse_area(row)
+                .on_enter(WindowMessage::HoverItem(Some(index)))
+                .on_exit(WindowMessage::HoverItem(None));
 
             entries = entries.push(wayland_tooltip(
-                row,
+                hoverable,
                 tooltip,
                 parent_window.unwrap_or(Id::RESERVED),
                 item.tooltip_popup_id,
                 item.tooltip_autosize_id.clone(),
+                true,
             ));
         }
     }
     widget::scrollable(entries)
         .id(history_scroll_id)
         .height(Length::Fill)
+        .into()
+}
+
+fn hover_action(
+    icon: &'static [u8],
+    message: WindowMessage,
+    width: f32,
+    row_hovered: bool,
+) -> Element<'static, WindowMessage> {
+    let icon = widget::svg(cosmic::iced::widget::svg::Handle::from_memory(icon))
+        .width(20.0)
+        .height(20.0)
+        .opacity(if row_hovered { 1.0 } else { 0.0 })
+        .symbolic(true);
+    let centered_icon = widget::container(icon)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Alignment::Center);
+    cosmic::iced::widget::button(centered_icon)
+        .width(width)
+        .height(Length::Fill)
+        .padding(0)
+        .class(cosmic::theme::iced::Button::Custom(Box::new(
+            move |_theme: &cosmic::Theme, status| {
+                let hovered = matches!(
+                    status,
+                    cosmic::iced::widget::button::Status::Hovered
+                        | cosmic::iced::widget::button::Status::Pressed
+                );
+                let color = if hovered {
+                    cosmic::iced::Color::from_rgba(1.0, 1.0, 1.0, 0.10)
+                } else {
+                    cosmic::iced::Color::TRANSPARENT
+                };
+                cosmic::iced::widget::button::Style {
+                    background: Some(cosmic::iced::Background::Color(color)),
+                    icon_color: Some(if row_hovered {
+                        cosmic::iced::Color::WHITE
+                    } else {
+                        cosmic::iced::Color::TRANSPARENT
+                    }),
+                    border: cosmic::iced::Border {
+                        radius: 8.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            },
+        )))
+        .on_press(message)
         .into()
 }
 
@@ -1097,6 +1530,7 @@ fn wayland_tooltip(
     parent: Id,
     popup_id: Id,
     autosize_id: widget::Id,
+    fill_width: bool,
 ) -> Element<'static, WindowMessage> {
     use cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::{
         Anchor, Gravity,
@@ -1106,61 +1540,66 @@ fn wayland_tooltip(
     };
 
     let is_image = tooltip.image.is_some();
-    cosmic::widget::wayland::tooltip::widget::Tooltip::<WindowMessage, WindowMessage>::new(
-        content,
-        Some(move |bounds: cosmic::iced::Rectangle| SctkPopupSettings {
-            parent,
-            id: popup_id,
-            grab: false,
-            input_zone: is_image.then(Vec::new),
-            positioner: SctkPositioner {
-                size: None,
-                size_limits: cosmic::iced::Limits::NONE.min_width(1.0).min_height(1.0),
-                anchor_rect: cosmic::iced::Rectangle {
-                    x: bounds.x.round() as i32,
-                    y: bounds.y.round() as i32,
-                    width: bounds.width.round() as i32,
-                    height: bounds.height.round() as i32,
+    let tooltip_widget =
+        cosmic::widget::wayland::tooltip::widget::Tooltip::<WindowMessage, WindowMessage>::new(
+            content,
+            Some(move |bounds: cosmic::iced::Rectangle| SctkPopupSettings {
+                parent,
+                id: popup_id,
+                grab: false,
+                input_zone: is_image.then(Vec::new),
+                positioner: SctkPositioner {
+                    size: None,
+                    size_limits: cosmic::iced::Limits::NONE.min_width(1.0).min_height(1.0),
+                    anchor_rect: cosmic::iced::Rectangle {
+                        x: bounds.x.round() as i32,
+                        y: bounds.y.round() as i32,
+                        width: bounds.width.round() as i32,
+                        height: bounds.height.round() as i32,
+                    },
+                    anchor: Anchor::BottomRight,
+                    gravity: Gravity::BottomRight,
+                    constraint_adjustment: 15,
+                    offset: (8, 8),
+                    reactive: true,
                 },
-                anchor: Anchor::BottomRight,
-                gravity: Gravity::BottomRight,
-                constraint_adjustment: 15,
-                offset: (8, 8),
-                reactive: true,
-            },
-            parent_size: None,
-            close_with_children: true,
-        }),
-        move || {
-            let tooltip_content = if let Some(handle) = tooltip.image.clone() {
-                let preview: Element<'static, cosmic::Action<WindowMessage>> = match handle {
-                    ImagePreviewHandle::Raster(handle) => widget::image(handle)
-                        .width(1920.0)
-                        .height(1080.0)
-                        .content_fit(cosmic::iced::ContentFit::Contain)
-                        .border_radius(8.0)
-                        .into(),
-                    ImagePreviewHandle::Svg(handle) => widget::svg(handle)
-                        .width(1920.0)
-                        .height(1080.0)
-                        .content_fit(cosmic::iced::ContentFit::Contain)
-                        .into(),
+                parent_size: None,
+                close_with_children: true,
+            }),
+            move || {
+                let tooltip_content = if let Some(handle) = tooltip.image.clone() {
+                    let preview: Element<'static, cosmic::Action<WindowMessage>> = match handle {
+                        ImagePreviewHandle::Raster(handle) => widget::image(handle)
+                            .width(1920.0)
+                            .height(1080.0)
+                            .content_fit(cosmic::iced::ContentFit::Contain)
+                            .border_radius(8.0)
+                            .into(),
+                        ImagePreviewHandle::Svg(handle) => widget::svg(handle)
+                            .width(1920.0)
+                            .height(1080.0)
+                            .content_fit(cosmic::iced::ContentFit::Contain)
+                            .into(),
+                    };
+                    widget::column::with_children([preview])
+                } else {
+                    widget::column::with_children([widget::text(tooltip.text.clone()).into()])
                 };
-                widget::column::with_children([preview])
-            } else {
-                widget::column::with_children([widget::text(tooltip.text.clone()).into()])
-            };
-            widget::autosize::autosize(
-                widget::layer_container(tooltip_content).padding(6),
-                autosize_id.clone(),
-            )
-            .into()
-        },
-        WindowMessage::Surface(cosmic::surface::action::destroy_popup(popup_id)),
-        WindowMessage::Surface,
-    )
-    .delay(Duration::from_millis(if is_image { 1_200 } else { 350 }))
-    .into()
+                widget::autosize::autosize(
+                    widget::layer_container(tooltip_content).padding(6),
+                    autosize_id.clone(),
+                )
+                .into()
+            },
+            WindowMessage::Surface(cosmic::surface::action::destroy_popup(popup_id)),
+            WindowMessage::Surface,
+        )
+        .delay(Duration::from_millis(if is_image { 1_200 } else { 350 }));
+    if fill_width {
+        tooltip_widget.width(Length::Fill).into()
+    } else {
+        tooltip_widget.into()
+    }
 }
 
 fn history_tooltip(item: &HistoryItem) -> HistoryTooltip {
@@ -1183,6 +1622,8 @@ fn history_tooltip(item: &HistoryItem) -> HistoryTooltip {
             clipboard_watcher::image_label(image),
             item.mime_type
         )
+    } else if let Some(files) = &item.files {
+        files_tooltip(files, &offered, &captured)
     } else {
         format!(
             "{characters} characters · {bytes} UTF-8 bytes · {lines} lines\nMIME: {}\nAvailable types: {offered}\nCaptured: {captured}",
@@ -1190,6 +1631,37 @@ fn history_tooltip(item: &HistoryItem) -> HistoryTooltip {
         ) + &color
     };
     HistoryTooltip { text, image: None }
+}
+
+fn files_tooltip(
+    files: &clipboard_watcher::ClipboardFiles,
+    offered: &str,
+    captured: &str,
+) -> String {
+    let operation = match files.operation {
+        clipboard_watcher::FileOperation::Copy => "Copy",
+        clipboard_watcher::FileOperation::Cut => "Cut",
+    };
+    let mut paths = files
+        .entries
+        .iter()
+        .take(20)
+        .map(|entry| {
+            entry
+                .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.uri.clone())
+        })
+        .collect::<Vec<_>>();
+    if files.entries.len() > paths.len() {
+        paths.push(format!("… and {} more", files.entries.len() - paths.len()));
+    }
+    format!(
+        "{}\nOperation: {operation}\n{}\nMIME: text/uri-list\nAvailable types: {offered}\nCaptured: {captured}",
+        clipboard_watcher::files_label(files),
+        paths.join("\n")
+    )
 }
 
 fn format_capture_time(captured_at: SystemTime, seconds: u64) -> String {
@@ -1271,6 +1743,7 @@ mod tests {
             available_mime_types: vec!["text/plain".into()],
             color_rgba: clipboard_watcher::parse_color_expression(text),
             image: None,
+            files: None,
             image_handle: None,
             image_preview_handle: None,
             captured_at: SystemTime::now(),
@@ -1278,6 +1751,10 @@ mod tests {
             tooltip_autosize_id: widget::Id::unique(),
             preview_popup_id: Id::unique(),
             preview_autosize_id: widget::Id::unique(),
+            to_file_popup_id: Id::unique(),
+            to_file_autosize_id: widget::Id::unique(),
+            to_data_popup_id: Id::unique(),
+            to_data_autosize_id: widget::Id::unique(),
         }
     }
 

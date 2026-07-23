@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -29,6 +29,7 @@ pub struct ClipboardUpdate {
     pub available_mime_types: Vec<String>,
     pub color_rgba: Option<[u8; 4]>,
     pub image: Option<ClipboardImage>,
+    pub files: Option<ClipboardFiles>,
     pub captured_at: SystemTime,
 }
 
@@ -44,7 +45,27 @@ pub struct ClipboardImage {
     pub is_svg: bool,
 }
 
-const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardFiles {
+    pub entries: Vec<ClipboardFile>,
+    pub operation: FileOperation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardFile {
+    pub uri: String,
+    pub path: Option<std::path::PathBuf>,
+    pub size: Option<u64>,
+    pub is_dir: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileOperation {
+    Copy,
+    Cut,
+}
+
+const MAX_CLIPBOARD_BYTES: u64 = 50 * 1024 * 1024;
 const THUMBNAIL_SIZE: u32 = 16;
 
 static UPDATES: OnceLock<broadcast::Sender<ClipboardUpdate>> = OnceLock::new();
@@ -74,7 +95,7 @@ fn copy_content(text: String, color_rgba: Option<[u8; 4]>) {
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
     std::thread::spawn(move || {
-        if let Err(error) = provide_clipboard(Some(text), color_rgba, None, generation) {
+        if let Err(error) = provide_clipboard(Some(text), color_rgba, None, None, generation) {
             eprintln!("Clipboard History could not set the clipboard: {error}");
         }
     });
@@ -89,8 +110,19 @@ pub fn copy_image(image: ClipboardImage) {
             .is_svg
             .then(|| String::from_utf8(image.bytes.as_ref().to_vec()).ok())
             .flatten();
-        if let Err(error) = provide_clipboard(text, None, Some(image), generation) {
+        if let Err(error) = provide_clipboard(text, None, Some(image), None, generation) {
             eprintln!("Clipboard History could not set the clipboard image: {error}");
+        }
+    });
+}
+
+pub fn copy_files(files: ClipboardFiles) {
+    let generation = WRITE_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    std::thread::spawn(move || {
+        if let Err(error) = provide_clipboard(None, None, None, Some(files), generation) {
+            eprintln!("Clipboard History could not set the clipboard files: {error}");
         }
     });
 }
@@ -99,6 +131,7 @@ fn provide_clipboard(
     text: Option<String>,
     color_rgba: Option<[u8; 4]>,
     image: Option<ClipboardImage>,
+    files: Option<ClipboardFiles>,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Wayland clipboard sources must remain alive while serving their data, so
@@ -131,6 +164,10 @@ fn provide_clipboard(
     if let Some(image) = &image {
         source.offer(image.mime_type.clone());
     }
+    if files.is_some() {
+        source.offer("text/uri-list".into());
+        source.offer("x-special/gnome-copied-files".into());
+    }
     device.set_selection(Some(&source));
     connection.flush()?;
     drop(setup);
@@ -139,6 +176,7 @@ fn provide_clipboard(
         text,
         native_color: color_rgba.map(encode_native_color),
         image,
+        files,
         cancelled: false,
         current_offer: None,
     };
@@ -198,39 +236,48 @@ async fn watch(
         drop(write);
 
         let mut bytes = Vec::new();
-        read.take(MAX_IMAGE_BYTES + 1)
+        read.take(MAX_CLIPBOARD_BYTES + 1)
             .read_to_end(&mut bytes)
             .await?;
         offer.destroy();
-        if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            eprintln!("Clipboard History ignored an image larger than 50 MiB");
+        if bytes.len() as u64 > MAX_CLIPBOARD_BYTES {
+            eprintln!("Clipboard History ignored clipboard data larger than 50 MiB");
             continue;
         }
         let content = if mime == "application/x-color" {
-            decode_native_color(&bytes).map(|rgba| (format_color(rgba), Some(rgba), None))
+            decode_native_color(&bytes).map(|rgba| (format_color(rgba), Some(rgba), None, None))
+        } else if is_file_mime(&mime) {
+            decode_files(&mime, &bytes).map(|files| (files_label(&files), None, None, Some(files)))
         } else if is_image_mime(&mime) {
-            decode_image(&mime, bytes).map(|image| (image_label(&image), None, Some(image)))
+            decode_image(&mime, bytes).map(|image| (image_label(&image), None, Some(image), None))
         } else {
             String::from_utf8(bytes).ok().map(|text| {
                 if let Some(image) = detect_svg_text(&text) {
-                    (image_label(&image), None, Some(image))
+                    (image_label(&image), None, Some(image), None)
                 } else {
                     let color = parse_color_expression(&text);
-                    (text, color, None)
+                    (text, color, None, None)
                 }
             })
         };
-        if let Some((text, color_rgba, image)) = content {
-            let recorded_mime = image
-                .as_ref()
-                .map(|image| image.mime_type.clone())
-                .unwrap_or(mime);
+        if let Some((text, color_rgba, image, files)) = content {
+            let recorded_mime = if image.is_some() {
+                image
+                    .as_ref()
+                    .map(|image| image.mime_type.clone())
+                    .unwrap_or(mime)
+            } else if files.is_some() {
+                "text/uri-list".into()
+            } else {
+                mime
+            };
             let _ = sender.send(ClipboardUpdate {
                 text,
                 mime_type: recorded_mime,
                 available_mime_types: mime_types,
                 color_rgba,
                 image,
+                files,
                 captured_at: SystemTime::now(),
             });
         }
@@ -239,6 +286,8 @@ async fn watch(
 
 fn preferred_mime(mime_types: &[String]) -> Option<&str> {
     [
+        "x-special/gnome-copied-files",
+        "text/uri-list",
         "image/png",
         "image/jpeg",
         "image/jpg",
@@ -263,6 +312,200 @@ fn preferred_mime(mime_types: &[String]) -> Option<&str> {
     })
 }
 
+fn is_file_mime(mime: &str) -> bool {
+    matches!(mime, "text/uri-list" | "x-special/gnome-copied-files")
+}
+
+fn decode_files(mime: &str, bytes: &[u8]) -> Option<ClipboardFiles> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let operation = if mime == "x-special/gnome-copied-files" {
+        match lines.next()? {
+            "copy" => FileOperation::Copy,
+            "cut" => FileOperation::Cut,
+            _ => return None,
+        }
+    } else {
+        FileOperation::Copy
+    };
+    let entries = lines
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(file_entry)
+        .collect::<Vec<_>>();
+    (!entries.is_empty()).then_some(ClipboardFiles { entries, operation })
+}
+
+fn file_entry(uri: &str) -> Option<ClipboardFile> {
+    let parsed = url::Url::parse(uri).ok()?;
+    let path = parsed.to_file_path().ok();
+    let metadata = path
+        .as_ref()
+        .and_then(|path| std::fs::symlink_metadata(path).ok());
+    Some(ClipboardFile {
+        uri: uri.to_owned(),
+        path,
+        size: metadata
+            .as_ref()
+            .filter(|metadata| metadata.is_file())
+            .map(std::fs::Metadata::len),
+        is_dir: metadata.is_some_and(|metadata| metadata.is_dir()),
+    })
+}
+
+pub fn files_label(files: &ClipboardFiles) -> String {
+    let total_size = files
+        .entries
+        .iter()
+        .filter_map(|entry| entry.size)
+        .sum::<u64>();
+    let size = (total_size > 0).then(|| format!(" · {}", format_bytes(total_size)));
+    if let [entry] = files.entries.as_slice() {
+        format!("{}{}", file_name(entry), size.unwrap_or_default())
+    } else {
+        let directories = files.entries.iter().filter(|entry| entry.is_dir).count();
+        let noun = if directories == files.entries.len() {
+            "folders"
+        } else if directories == 0 {
+            "files"
+        } else {
+            "items"
+        };
+        format!("{} {noun}{}", files.entries.len(), size.unwrap_or_default())
+    }
+}
+
+pub fn file_name(file: &ClipboardFile) -> String {
+    file.path
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .or_else(|| {
+            url::Url::parse(&file.uri)
+                .ok()?
+                .path_segments()?
+                .next_back()
+                .map(str::to_owned)
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| file.uri.clone())
+}
+
+pub fn file_reference(path: &std::path::Path) -> std::io::Result<ClipboardFiles> {
+    let uri = url::Url::from_file_path(path)
+        .map_err(|()| std::io::Error::other("temporary file path is not an absolute file path"))?
+        .to_string();
+    let entry =
+        file_entry(&uri).ok_or_else(|| std::io::Error::other("could not create a file URI"))?;
+    Ok(ClipboardFiles {
+        entries: vec![entry],
+        operation: FileOperation::Copy,
+    })
+}
+
+pub fn read_file_as_clipboard_update(path: &std::path::Path) -> std::io::Result<ClipboardUpdate> {
+    let metadata = fs_metadata_file(path)?;
+    if metadata.len() > MAX_CLIPBOARD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file is larger than 50 MiB",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)?
+        .take(MAX_CLIPBOARD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CLIPBOARD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file is larger than 50 MiB",
+        ));
+    }
+
+    if let Ok(text) = std::str::from_utf8(&bytes)
+        && let Some(image) = detect_svg_text(text)
+    {
+        return Ok(ClipboardUpdate {
+            text: image_label(&image),
+            mime_type: "image/svg+xml".into(),
+            available_mime_types: vec!["image/svg+xml".into(), "text/plain".into()],
+            color_rgba: None,
+            image: Some(image),
+            files: None,
+            captured_at: SystemTime::now(),
+        });
+    }
+    if let Ok(format) = image::guess_format(&bytes)
+        && let Some(mime) = mime_for_image_format(format)
+        && let Some(image) = decode_image(mime, bytes.clone())
+    {
+        return Ok(ClipboardUpdate {
+            text: image_label(&image),
+            mime_type: mime.into(),
+            available_mime_types: vec![mime.into()],
+            color_rgba: None,
+            image: Some(image),
+            files: None,
+            captured_at: SystemTime::now(),
+        });
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file is neither a supported image nor UTF-8 text",
+        )
+    })?;
+    Ok(ClipboardUpdate {
+        color_rgba: parse_color_expression(&text),
+        text,
+        mime_type: "text/plain;charset=utf-8".into(),
+        available_mime_types: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+        image: None,
+        files: None,
+        captured_at: SystemTime::now(),
+    })
+}
+
+fn fs_metadata_file(path: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_file() {
+        Ok(metadata)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clipboard URI does not refer to a regular file",
+        ))
+    }
+}
+
+fn uri_list_payload(files: &ClipboardFiles) -> Vec<u8> {
+    let mut payload = files
+        .entries
+        .iter()
+        .map(|entry| entry.uri.as_str())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    payload.push_str("\r\n");
+    payload.into_bytes()
+}
+
+fn gnome_files_payload(files: &ClipboardFiles) -> Vec<u8> {
+    let operation = match files.operation {
+        FileOperation::Copy => "copy",
+        FileOperation::Cut => "cut",
+    };
+    let mut payload = format!("{operation}\n");
+    payload.push_str(
+        &files
+            .entries
+            .iter()
+            .map(|entry| entry.uri.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    payload.push('\n');
+    payload.into_bytes()
+}
+
 fn is_image_mime(mime: &str) -> bool {
     mime == "image/svg+xml" || image_format(mime).is_some()
 }
@@ -275,6 +518,18 @@ fn image_format(mime: &str) -> Option<image::ImageFormat> {
         "image/gif" => Some(image::ImageFormat::Gif),
         "image/bmp" | "image/x-bmp" => Some(image::ImageFormat::Bmp),
         "image/tiff" => Some(image::ImageFormat::Tiff),
+        _ => None,
+    }
+}
+
+fn mime_for_image_format(format: image::ImageFormat) -> Option<&'static str> {
+    match format {
+        image::ImageFormat::Png => Some("image/png"),
+        image::ImageFormat::Jpeg => Some("image/jpeg"),
+        image::ImageFormat::WebP => Some("image/webp"),
+        image::ImageFormat::Gif => Some("image/gif"),
+        image::ImageFormat::Bmp => Some("image/bmp"),
+        image::ImageFormat::Tiff => Some("image/tiff"),
         _ => None,
     }
 }
@@ -355,11 +610,11 @@ pub fn image_label(image: &ClipboardImage) -> String {
         "{} × {} · {}",
         image.width,
         image.height,
-        format_bytes(image.bytes.len())
+        format_bytes(image.bytes.len() as u64)
     )
 }
 
-fn format_bytes(bytes: usize) -> String {
+fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     let bytes = bytes as f64;
@@ -368,7 +623,7 @@ fn format_bytes(bytes: usize) -> String {
     } else if bytes >= KIB {
         format!("{:.1} KiB", bytes / KIB)
     } else {
-        format!("{} B", bytes as usize)
+        format!("{} B", bytes as u64)
     }
 }
 
@@ -555,6 +810,7 @@ struct CopyState {
     text: Option<String>,
     native_color: Option<Vec<u8>>,
     image: Option<ClipboardImage>,
+    files: Option<ClipboardFiles>,
     cancelled: bool,
     current_offer: Option<Offer>,
 }
@@ -625,6 +881,22 @@ impl Dispatch<Source, ()> for CopyState {
                     && mime_type == image.mime_type
                 {
                     &image.bytes
+                } else if let Some(files) = &state.files
+                    && mime_type == "text/uri-list"
+                {
+                    let payload = uri_list_payload(files);
+                    if let Err(error) = file.write_all(&payload) {
+                        eprintln!("Clipboard History could not serve clipboard data: {error}");
+                    }
+                    return;
+                } else if let Some(files) = &state.files
+                    && mime_type == "x-special/gnome-copied-files"
+                {
+                    let payload = gnome_files_payload(files);
+                    if let Err(error) = file.write_all(&payload) {
+                        eprintln!("Clipboard History could not serve clipboard data: {error}");
+                    }
+                    return;
                 } else {
                     state.text.as_deref().unwrap_or_default().as_bytes()
                 };
@@ -750,5 +1022,72 @@ mod tests {
     #[test]
     fn does_not_treat_an_svg_fragment_as_an_image() {
         assert!(detect_svg_text(r#"Use <svg viewBox="0 0 10 10"> here"#).is_none());
+    }
+
+    #[test]
+    fn parses_and_restores_standard_file_uri_lists() {
+        let payload =
+            b"# copied files\r\nfile:///tmp/first%20file.txt\r\nfile:///tmp/second.txt\r\n";
+        let files = decode_files("text/uri-list", payload).expect("decode URI list");
+
+        assert_eq!(files.operation, FileOperation::Copy);
+        assert_eq!(files.entries.len(), 2);
+        assert_eq!(file_name(&files.entries[0]), "first file.txt");
+        assert_eq!(
+            uri_list_payload(&files),
+            b"file:///tmp/first%20file.txt\r\nfile:///tmp/second.txt\r\n"
+        );
+    }
+
+    #[test]
+    fn preserves_gnome_cut_intent() {
+        let payload = b"cut\nfile:///tmp/example.txt\n";
+        let files =
+            decode_files("x-special/gnome-copied-files", payload).expect("decode GNOME files");
+
+        assert_eq!(files.operation, FileOperation::Cut);
+        assert_eq!(gnome_files_payload(&files), payload);
+    }
+
+    #[test]
+    fn reads_a_text_file_back_as_clipboard_data() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temporary text file");
+        file.write_all(b"#33aadd")
+            .expect("write temporary text file");
+
+        let update =
+            read_file_as_clipboard_update(file.path()).expect("read text as clipboard data");
+
+        assert_eq!(update.text, "#33aadd");
+        assert_eq!(update.mime_type, "text/plain;charset=utf-8");
+        assert_eq!(update.color_rgba, Some([0x33, 0xaa, 0xdd, 0xff]));
+        assert!(update.image.is_none());
+        assert!(update.files.is_none());
+    }
+
+    #[test]
+    fn reads_an_image_file_back_as_clipboard_data() {
+        use image::ImageEncoder;
+
+        let mut encoded = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut encoded)
+            .write_image(&[0x80; 4 * 4 * 4], 4, 4, image::ExtendedColorType::Rgba8)
+            .expect("encode test PNG");
+        let mut file = tempfile::NamedTempFile::new().expect("create temporary image file");
+        file.write_all(&encoded)
+            .expect("write temporary image file");
+
+        let update =
+            read_file_as_clipboard_update(file.path()).expect("read image as clipboard data");
+
+        assert_eq!(update.mime_type, "image/png");
+        assert_eq!(
+            update
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            Some((4, 4))
+        );
+        assert!(update.files.is_none());
     }
 }
