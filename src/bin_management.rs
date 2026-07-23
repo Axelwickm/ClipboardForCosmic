@@ -6,8 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const BINARY_NAME: &str = "jax-clipboard-history";
-const SERVICE_NAME: &str = "jax-clipboard-history.service";
+const BINARY_NAME: &str = "clipboard-for-cosmic";
+const SERVICE_NAME: &str = "clipboard-for-cosmic.service";
 
 pub fn install() -> Result<(), Box<dyn Error>> {
     let paths = Paths::new()?;
@@ -88,7 +88,7 @@ impl Paths {
             legacy_flash_icon: icons_dir.join(format!("{APP_ID}-flash.svg")),
             legacy_symbolic_flash_icon: icons_dir.join(format!("{APP_ID}-flash-symbolic.svg")),
             legacy_data_control_environment: home
-                .join(".config/environment.d/jax-clipboard-history.conf"),
+                .join(".config/environment.d/clipboard-for-cosmic.conf"),
             bin_dir,
             applications_dir,
             icons_dir,
@@ -146,7 +146,7 @@ fn install_binary(source: &Path, destination: &Path) -> Result<(), Box<dyn Error
 
 fn desktop_entry(binary: &Path) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName={APP_NAME}\nComment=Clipboard history for COSMIC\nExec={}\nIcon={APP_ID}-symbolic\nNoDisplay=true\nTerminal=false\nCategories=Utility;\nActions=Show;\n\n[Desktop Action Show]\nName=Show Clipboard History\nExec={} show\n",
+        "[Desktop Entry]\nType=Application\nName={APP_NAME}\nComment=Clipboard history for COSMIC\nExec={}\nIcon={APP_ID}-symbolic\nNoDisplay=true\nTerminal=false\nCategories=Utility;\nActions=Show;\n\n[Desktop Action Show]\nName=Show ClipboardForCosmic\nExec={} show\n",
         binary.display(),
         binary.display()
     )
@@ -154,7 +154,7 @@ fn desktop_entry(binary: &Path) -> String {
 
 fn autostart_entry() -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName={APP_NAME}\nComment=Start Clipboard History in the background\nExec=systemctl --user start {SERVICE_NAME}\nIcon={APP_ID}-symbolic\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName={APP_NAME}\nComment=Start ClipboardForCosmic in the background\nExec=systemctl --user start {SERVICE_NAME}\nIcon={APP_ID}-symbolic\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
     )
 }
 

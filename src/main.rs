@@ -22,8 +22,9 @@ use std::time::Duration;
 use std::time::SystemTime;
 use tokio::sync::broadcast;
 
-pub(crate) const APP_ID: &str = "com.github.jax.ClipboardHistory";
-pub(crate) const APP_NAME: &str = "Clipboard History";
+pub(crate) const APP_ID: &str = "com.github.clipboardforcosmic.ClipboardForCosmic";
+pub(crate) const APP_NAME: &str = "ClipboardForCosmic";
+const REPOSITORY_URL: &str = "https://github.com/Axelwickm/ClipboardForCosmic";
 pub(crate) const ICON: &[u8] = include_bytes!("../resources/clipboard-history-symbolic.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../resources/delete-symbolic.svg");
 const TO_FILE_ICON: &[u8] = include_bytes!("../resources/to-file-symbolic.svg");
@@ -59,7 +60,7 @@ fn run_management(result: Result<(), Box<dyn std::error::Error>>) {
 }
 
 fn print_usage() {
-    println!("Usage: jax-clipboard-history [install|uninstall|show]");
+    println!("Usage: clipboard-for-cosmic [install|uninstall|show]");
 }
 
 fn launch() {
@@ -94,7 +95,7 @@ const CONTROL_MESSAGE_SHOW: &[u8] = b"show";
 
 fn control_socket_path() -> io::Result<std::path::PathBuf> {
     dirs::runtime_dir()
-        .map(|directory| directory.join("jax-clipboard-history.sock"))
+        .map(|directory| directory.join("clipboard-for-cosmic.sock"))
         .ok_or_else(|| io::Error::other("could not determine the runtime directory"))
 }
 
@@ -139,6 +140,7 @@ fn start_control_socket() {
 #[derive(Clone, Copy)]
 enum TrayEvent {
     Activate,
+    OpenRepository,
     Shutdown,
     ClearHistory,
     ConfigureShortcut,
@@ -253,6 +255,17 @@ impl ksni::Tray for TrayIcon {
                         Ok(()) => tray.autostart = enabled,
                         Err(error) => eprintln!("{APP_NAME}: could not change autostart: {error}"),
                     }
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::menu::StandardItem {
+                label: "Project page".into(),
+                activate: Box::new(|_| {
+                    let _ = TRAY_EVENTS
+                        .get()
+                        .expect("tray sender")
+                        .send(TrayEvent::OpenRepository);
                 }),
                 ..Default::default()
             }
@@ -405,7 +418,7 @@ impl InstanceGuard {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(state_dir.join("jax-clipboard-history.lock"))?;
+            .open(state_dir.join("clipboard-for-cosmic.lock"))?;
 
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Some(Self { _file: file })),
@@ -515,6 +528,7 @@ enum WindowMessage {
     Surface(cosmic::surface::Action),
     KeyboardInput(Id, KeyboardInput),
     SearchInput(String),
+    OpenRepository,
     Ignore,
     SearchCompleted {
         generation: u64,
@@ -559,6 +573,7 @@ impl std::fmt::Debug for WindowMessage {
                 .finish(),
             Self::SearchInput(_) => formatter.write_str("SearchInput"),
             Self::Ignore => formatter.write_str("Ignore"),
+            Self::OpenRepository => formatter.write_str("OpenRepository"),
             Self::SearchCompleted {
                 generation,
                 results,
@@ -639,6 +654,7 @@ impl cosmic::Application for ClipboardWindow {
                     while let Ok(event) = events.recv().await {
                         let message = match event {
                             TrayEvent::Activate => WindowMessage::Focus,
+                            TrayEvent::OpenRepository => WindowMessage::OpenRepository,
                             TrayEvent::Shutdown => WindowMessage::Shutdown,
                             TrayEvent::ClearHistory => WindowMessage::ClearHistory,
                             TrayEvent::ConfigureShortcut => WindowMessage::ConfigureShortcut,
@@ -997,6 +1013,14 @@ impl cosmic::Application for ClipboardWindow {
                 return self.refresh_search();
             }
             WindowMessage::Ignore => {}
+            WindowMessage::OpenRepository => {
+                if let Err(error) = std::process::Command::new("xdg-open")
+                    .arg(REPOSITORY_URL)
+                    .spawn()
+                {
+                    eprintln!("{APP_NAME}: could not open repository link: {error}");
+                }
+            }
             WindowMessage::SearchCompleted {
                 generation,
                 results,
@@ -1020,7 +1044,7 @@ impl cosmic::Application for ClipboardWindow {
 
 fn clipboard_content(state: &ClipboardWindow) -> Element<'static, WindowMessage> {
     let status_bar = widget::container(widget::row::with_children([
-        widget::text("JAX clipboard").into(),
+        widget::text(APP_NAME).into(),
         widget::Space::new().width(Length::Fill).into(),
         widget::text(format!(
             "{}/{} items",
@@ -1256,7 +1280,7 @@ const TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 fn temp_storage_dir() -> io::Result<std::path::PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
-    let path = std::path::PathBuf::from("/tmp/jax-clipboard-history");
+    let path = std::path::PathBuf::from("/tmp/clipboard-for-cosmic");
     match fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -1298,7 +1322,7 @@ fn cleanup_stale_temp_files() -> io::Result<()> {
 }
 
 fn generated_path(files: &clipboard_watcher::ClipboardFiles) -> Option<std::path::PathBuf> {
-    let directory = std::path::Path::new("/tmp/jax-clipboard-history");
+    let directory = std::path::Path::new("/tmp/clipboard-for-cosmic");
     files.entries.iter().find_map(|entry| {
         entry
             .path

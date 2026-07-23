@@ -96,7 +96,7 @@ fn copy_content(text: String, color_rgba: Option<[u8; 4]>) {
         .wrapping_add(1);
     std::thread::spawn(move || {
         if let Err(error) = provide_clipboard(Some(text), color_rgba, None, None, generation) {
-            eprintln!("Clipboard History could not set the clipboard: {error}");
+            eprintln!("ClipboardForCosmic could not set the clipboard: {error}");
         }
     });
 }
@@ -111,7 +111,7 @@ pub fn copy_image(image: ClipboardImage) {
             .then(|| String::from_utf8(image.bytes.as_ref().to_vec()).ok())
             .flatten();
         if let Err(error) = provide_clipboard(text, None, Some(image), None, generation) {
-            eprintln!("Clipboard History could not set the clipboard image: {error}");
+            eprintln!("ClipboardForCosmic could not set the clipboard image: {error}");
         }
     });
 }
@@ -122,7 +122,7 @@ pub fn copy_files(files: ClipboardFiles) {
         .wrapping_add(1);
     std::thread::spawn(move || {
         if let Err(error) = provide_clipboard(None, None, None, Some(files), generation) {
-            eprintln!("Clipboard History could not set the clipboard files: {error}");
+            eprintln!("ClipboardForCosmic could not set the clipboard files: {error}");
         }
     });
 }
@@ -195,7 +195,7 @@ fn start(sender: broadcast::Sender<ClipboardUpdate>) {
 
         runtime.block_on(async move {
             if let Err(error) = watch(sender).await {
-                eprintln!("Clipboard History watcher stopped: {error}");
+                eprintln!("ClipboardForCosmic watcher stopped: {error}");
             }
         });
     });
@@ -241,7 +241,7 @@ async fn watch(
             .await?;
         offer.destroy();
         if bytes.len() as u64 > MAX_CLIPBOARD_BYTES {
-            eprintln!("Clipboard History ignored clipboard data larger than 50 MiB");
+            eprintln!("ClipboardForCosmic ignored clipboard data larger than 50 MiB");
             continue;
         }
         let content = if mime == "application/x-color" {
@@ -872,7 +872,7 @@ impl Dispatch<Source, ()> for CopyState {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
                 let mut file = std::fs::File::from(fd);
                 if let Err(error) = make_blocking(&file) {
-                    eprintln!("Clipboard History could not prepare clipboard transfer: {error}");
+                    eprintln!("ClipboardForCosmic could not prepare clipboard transfer: {error}");
                     return;
                 }
                 let data = if mime_type == "application/x-color" {
@@ -886,7 +886,7 @@ impl Dispatch<Source, ()> for CopyState {
                 {
                     let payload = uri_list_payload(files);
                     if let Err(error) = file.write_all(&payload) {
-                        eprintln!("Clipboard History could not serve clipboard data: {error}");
+                        eprintln!("ClipboardForCosmic could not serve clipboard data: {error}");
                     }
                     return;
                 } else if let Some(files) = &state.files
@@ -894,14 +894,14 @@ impl Dispatch<Source, ()> for CopyState {
                 {
                     let payload = gnome_files_payload(files);
                     if let Err(error) = file.write_all(&payload) {
-                        eprintln!("Clipboard History could not serve clipboard data: {error}");
+                        eprintln!("ClipboardForCosmic could not serve clipboard data: {error}");
                     }
                     return;
                 } else {
                     state.text.as_deref().unwrap_or_default().as_bytes()
                 };
                 if let Err(error) = file.write_all(data) {
-                    eprintln!("Clipboard History could not serve clipboard data: {error}");
+                    eprintln!("ClipboardForCosmic could not serve clipboard data: {error}");
                 }
             }
             ext_data_control_source_v1::Event::Cancelled => {

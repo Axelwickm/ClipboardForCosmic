@@ -1,4 +1,4 @@
-# Jax Clipboard History
+# ClipboardForCosmic
 
 A small clipboard-history application for the COSMIC desktop, built with
 libcosmic.
@@ -23,7 +23,7 @@ To add a global shortcut, bind this command in COSMIC Settings → Keyboard →
 Custom Shortcuts:
 
 ```sh
-~/.local/bin/jax-clipboard-history show
+~/.local/bin/clipboard-for-cosmic show
 ```
 
 On Debian/Ubuntu-based systems, libcosmic's usual build dependencies are:

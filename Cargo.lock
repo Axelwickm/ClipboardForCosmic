@@ -686,6 +686,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "clipboard-for-cosmic"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "fs2",
+ "image",
+ "ksni",
+ "libc",
+ "libcosmic",
+ "resvg",
+ "tempfile",
+ "tokio",
+ "url",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2486,24 +2504,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "jax-clipboard-history"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "fs2",
- "image",
- "ksni",
- "libc",
- "libcosmic",
- "resvg",
- "tempfile",
- "tokio",
- "url",
- "wayland-client",
- "wayland-protocols",
-]
 
 [[package]]
 name = "jiff"
