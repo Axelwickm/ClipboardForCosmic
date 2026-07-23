@@ -39,6 +39,9 @@ pub struct ClipboardImage {
     pub bytes: Arc<[u8]>,
     pub width: u32,
     pub height: u32,
+    pub preview_rgba: Arc<[u8]>,
+    pub preview_width: u32,
+    pub preview_height: u32,
     pub thumbnail_rgba: Arc<[u8]>,
     pub thumbnail_width: u32,
     pub thumbnail_height: u32,
@@ -67,6 +70,8 @@ pub enum FileOperation {
 
 const MAX_CLIPBOARD_BYTES: u64 = 50 * 1024 * 1024;
 const THUMBNAIL_SIZE: u32 = 16;
+const PREVIEW_MAX_WIDTH: u32 = 960;
+const PREVIEW_MAX_HEIGHT: u32 = 540;
 
 static UPDATES: OnceLock<broadcast::Sender<ClipboardUpdate>> = OnceLock::new();
 static WRITE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -542,6 +547,10 @@ fn decode_image(mime_type: &str, bytes: Vec<u8>) -> Option<ClipboardImage> {
 
     let decoded = image::load_from_memory_with_format(&bytes, image_format(mime_type)?).ok()?;
     let (width, height) = decoded.dimensions();
+    let preview = decoded
+        .thumbnail(PREVIEW_MAX_WIDTH.min(width), PREVIEW_MAX_HEIGHT.min(height))
+        .to_rgba8();
+    let (preview_width, preview_height) = preview.dimensions();
     let thumbnail = decoded
         .thumbnail(THUMBNAIL_SIZE.min(width), THUMBNAIL_SIZE.min(height))
         .to_rgba8();
@@ -551,6 +560,9 @@ fn decode_image(mime_type: &str, bytes: Vec<u8>) -> Option<ClipboardImage> {
         bytes: Arc::from(bytes),
         width,
         height,
+        preview_rgba: Arc::from(preview.into_raw()),
+        preview_width,
+        preview_height,
         thumbnail_rgba: Arc::from(thumbnail.into_raw()),
         thumbnail_width,
         thumbnail_height,
@@ -563,19 +575,47 @@ fn decode_svg(bytes: Vec<u8>) -> Option<ClipboardImage> {
     let size = tree.size();
     let width = size.width().round().max(1.0) as u32;
     let height = size.height().round().max(1.0) as u32;
+    let preview_scale = (PREVIEW_MAX_WIDTH as f32 / size.width())
+        .min(PREVIEW_MAX_HEIGHT as f32 / size.height())
+        .min(1.0);
+    let preview_width = (size.width() * preview_scale).round().max(1.0) as u32;
+    let preview_height = (size.height() * preview_scale).round().max(1.0) as u32;
+    let preview_rgba = render_svg_rgba(&tree, preview_width, preview_height, preview_scale)?;
     let scale = (THUMBNAIL_SIZE as f32 / size.width())
         .min(THUMBNAIL_SIZE as f32 / size.height())
         .min(1.0);
     let thumbnail_width = (size.width() * scale).round().max(1.0) as u32;
     let thumbnail_height = (size.height() * scale).round().max(1.0) as u32;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(thumbnail_width, thumbnail_height)?;
+    let thumbnail_rgba = render_svg_rgba(&tree, thumbnail_width, thumbnail_height, scale)?;
+    Some(ClipboardImage {
+        mime_type: "image/svg+xml".into(),
+        bytes: Arc::from(bytes),
+        width,
+        height,
+        preview_rgba: Arc::from(preview_rgba),
+        preview_width,
+        preview_height,
+        thumbnail_rgba: Arc::from(thumbnail_rgba),
+        thumbnail_width,
+        thumbnail_height,
+        is_svg: true,
+    })
+}
+
+fn render_svg_rgba(
+    tree: &resvg::usvg::Tree,
+    width: u32,
+    height: u32,
+    scale: f32,
+) -> Option<Vec<u8>> {
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
     resvg::render(
-        &tree,
+        tree,
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
-    let mut thumbnail_rgba = pixmap.take();
-    for pixel in thumbnail_rgba.chunks_exact_mut(4) {
+    let mut rgba = pixmap.take();
+    for pixel in rgba.chunks_exact_mut(4) {
         let alpha = u16::from(pixel[3]);
         for channel in &mut pixel[..3] {
             *channel = (u16::from(*channel) * 255)
@@ -584,16 +624,7 @@ fn decode_svg(bytes: Vec<u8>) -> Option<ClipboardImage> {
                 .min(255) as u8;
         }
     }
-    Some(ClipboardImage {
-        mime_type: "image/svg+xml".into(),
-        bytes: Arc::from(bytes),
-        width,
-        height,
-        thumbnail_rgba: Arc::from(thumbnail_rgba),
-        thumbnail_width,
-        thumbnail_height,
-        is_svg: true,
-    })
+    Some(rgba)
 }
 
 fn detect_svg_text(text: &str) -> Option<ClipboardImage> {
@@ -987,6 +1018,8 @@ mod tests {
         let image = decode_image("image/png", encoded).expect("decode test PNG");
 
         assert_eq!((image.width, image.height), (64, 32));
+        assert_eq!((image.preview_width, image.preview_height), (64, 32));
+        assert_eq!(image.preview_rgba.len(), 64 * 32 * 4);
         assert_eq!((image.thumbnail_width, image.thumbnail_height), (16, 8));
         assert_eq!(image.thumbnail_rgba.len(), 16 * 8 * 4);
     }
@@ -1001,6 +1034,8 @@ mod tests {
 
         assert!(image.is_svg);
         assert_eq!((image.width, image.height), (200, 100));
+        assert_eq!((image.preview_width, image.preview_height), (200, 100));
+        assert_eq!(image.preview_rgba.len(), 200 * 100 * 4);
         assert_eq!((image.thumbnail_width, image.thumbnail_height), (16, 8));
         assert_eq!(image.thumbnail_rgba.len(), 16 * 8 * 4);
         assert_eq!(image.bytes.as_ref(), svg);

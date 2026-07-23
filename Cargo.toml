@@ -18,3 +18,12 @@ tokio = { version = "1", features = ["io-util", "net", "rt", "sync"] }
 url = "2"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+[profile.dev.package.iced_tiny_skia]
+opt-level = 3
+
+[profile.dev.package.tiny-skia]
+opt-level = 3
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 3

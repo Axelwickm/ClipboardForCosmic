@@ -18,8 +18,7 @@ use ksni::blocking::TrayMethods;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
 
 pub(crate) const APP_ID: &str = "com.github.clipboardforcosmic.ClipboardForCosmic";
@@ -449,19 +448,36 @@ struct ClipboardWindow {
 }
 
 impl ClipboardWindow {
+    fn preview_popup_task(&self, index: usize) -> Task<WindowMessage> {
+        let Some(popup_id) = image_preview_popup_id(&self.history, index) else {
+            return Task::none();
+        };
+        Task::done(cosmic::Action::App(WindowMessage::Surface(
+            cosmic::surface::action::destroy_popup(popup_id),
+        )))
+    }
+
+    fn dismiss_hovered_preview(&mut self) -> Task<WindowMessage> {
+        let Some(index) = self.hovered_item.take() else {
+            return Task::none();
+        };
+        self.preview_popup_task(index)
+    }
+
     fn close_content_window(&mut self) -> Task<WindowMessage> {
         let Some(id) = self.content_window.take() else {
             return Task::none();
         };
+        let dismiss_preview = self.dismiss_hovered_preview();
         self.closing_window = Some(id);
         self.content_window_focused = false;
-        self.hovered_item = None;
         self.search_query.clear();
         self.search_results.clear();
         self.search_generation = self.search_generation.wrapping_add(1);
-        cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
-            destroy_window(id),
-        )))
+        let destroy_window = cosmic::task::message(cosmic::Action::Cosmic(
+            cosmic::app::Action::Surface(destroy_window(id)),
+        ));
+        dismiss_preview.chain(destroy_window)
     }
 
     fn refresh_search(&mut self) -> Task<WindowMessage> {
@@ -518,6 +534,7 @@ enum WindowMessage {
     ConvertToFile(usize),
     DeleteItem(usize),
     HoverItem(Option<usize>),
+    DismissPreview(usize),
     ClearHistory,
     Shutdown,
     ConfigureShortcut,
@@ -527,6 +544,7 @@ enum WindowMessage {
     SetHistoryLimit(usize),
     Surface(cosmic::surface::Action),
     KeyboardInput(Id, KeyboardInput),
+    PointerLeft(Id),
     SearchInput(String),
     OpenRepository,
     Ignore,
@@ -551,6 +569,10 @@ impl std::fmt::Debug for WindowMessage {
             }
             Self::DeleteItem(index) => formatter.debug_tuple("DeleteItem").field(index).finish(),
             Self::HoverItem(index) => formatter.debug_tuple("HoverItem").field(index).finish(),
+            Self::DismissPreview(index) => formatter
+                .debug_tuple("DismissPreview")
+                .field(index)
+                .finish(),
             Self::ClearHistory => formatter.write_str("ClearHistory"),
             Self::Shutdown => formatter.write_str("Shutdown"),
             Self::ConfigureShortcut => formatter.write_str("ConfigureShortcut"),
@@ -571,6 +593,7 @@ impl std::fmt::Debug for WindowMessage {
                 .field(id)
                 .field(key)
                 .finish(),
+            Self::PointerLeft(id) => formatter.debug_tuple("PointerLeft").field(id).finish(),
             Self::SearchInput(_) => formatter.write_str("SearchInput"),
             Self::Ignore => formatter.write_str("Ignore"),
             Self::OpenRepository => formatter.write_str("OpenRepository"),
@@ -669,42 +692,45 @@ impl cosmic::Application for ClipboardWindow {
         });
         let window_events =
             cosmic::iced::window::events().map(|(id, event)| WindowMessage::WindowEvent(id, event));
-        let keyboard = cosmic::iced::event::listen_with(|event, _, id| {
-            let cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+        let input = cosmic::iced::event::listen_with(|event, _, id| match event {
+            cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::CursorLeft) => {
+                Some(WindowMessage::PointerLeft(id))
+            }
+            cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
                 key,
                 modifiers,
                 text,
                 ..
-            }) = event
-            else {
-                return None;
-            };
-            use cosmic::iced::keyboard::key::Named;
-            let input = match key {
-                cosmic::iced::keyboard::Key::Named(Named::ArrowUp) => KeyboardInput::Up,
-                cosmic::iced::keyboard::Key::Named(Named::ArrowDown) => KeyboardInput::Down,
-                cosmic::iced::keyboard::Key::Named(Named::Tab) => KeyboardInput::Tab {
-                    backwards: modifiers.shift(),
-                },
-                cosmic::iced::keyboard::Key::Named(Named::Enter) => KeyboardInput::Enter,
-                cosmic::iced::keyboard::Key::Named(Named::Escape) => KeyboardInput::Escape,
-                _ if !modifiers.control() && !modifiers.logo() => {
-                    let text = text?.to_string();
-                    if text.chars().all(char::is_control) {
-                        return None;
+            }) => {
+                use cosmic::iced::keyboard::key::Named;
+                let input = match key {
+                    cosmic::iced::keyboard::Key::Named(Named::ArrowUp) => KeyboardInput::Up,
+                    cosmic::iced::keyboard::Key::Named(Named::ArrowDown) => KeyboardInput::Down,
+                    cosmic::iced::keyboard::Key::Named(Named::Tab) => KeyboardInput::Tab {
+                        backwards: modifiers.shift(),
+                    },
+                    cosmic::iced::keyboard::Key::Named(Named::Enter) => KeyboardInput::Enter,
+                    cosmic::iced::keyboard::Key::Named(Named::Escape) => KeyboardInput::Escape,
+                    _ if !modifiers.control() && !modifiers.logo() => {
+                        let text = text?.to_string();
+                        if text.chars().all(char::is_control) {
+                            return None;
+                        }
+                        KeyboardInput::StartSearch(text)
                     }
-                    KeyboardInput::StartSearch(text)
-                }
-                _ => return None,
-            };
-            Some(WindowMessage::KeyboardInput(id, input))
+                    _ => return None,
+                };
+                Some(WindowMessage::KeyboardInput(id, input))
+            }
+            _ => None,
         });
-        Subscription::batch([clipboard, tray, window_events, keyboard])
+        Subscription::batch([clipboard, tray, window_events, input])
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             WindowMessage::ClipboardUpdated(update) => {
+                let dismiss_preview = self.dismiss_hovered_preview();
                 if !update.text.trim().is_empty() {
                     flash_tray_icon();
                 }
@@ -719,7 +745,7 @@ impl cosmic::Application for ClipboardWindow {
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
-                return self.refresh_search();
+                return dismiss_preview.chain(self.refresh_search());
             }
             WindowMessage::ActivateItem(index) => {
                 let Some(item) =
@@ -746,6 +772,7 @@ impl cosmic::Application for ClipboardWindow {
                         return Task::none();
                     }
                 };
+                let dismiss_preview = self.dismiss_hovered_preview();
                 let label = clipboard_watcher::files_label(&files);
                 self.active_generated_file = generated_path(&files);
                 self.generated_files
@@ -768,7 +795,7 @@ impl cosmic::Application for ClipboardWindow {
                 );
                 self.selected_item = Some(0);
                 clipboard_watcher::copy_files(files);
-                return self.refresh_search();
+                return dismiss_preview.chain(self.refresh_search());
             }
             WindowMessage::ConvertToData(index) => {
                 let Some(path) = self
@@ -787,15 +814,17 @@ impl cosmic::Application for ClipboardWindow {
                         return Task::none();
                     }
                 };
+                let dismiss_preview = self.dismiss_hovered_preview();
                 record_history(&mut self.history, update, self.max_history_items);
                 if let Some(item) =
                     activate_history_item(&mut self.history, &mut self.selected_item, 0)
                 {
                     self.active_generated_file = activate_clipboard_content(item);
                 }
-                return self.refresh_search();
+                return dismiss_preview.chain(self.refresh_search());
             }
             WindowMessage::DeleteItem(index) => {
+                let dismiss_preview = self.dismiss_hovered_preview();
                 if index < self.history.len() {
                     self.history.remove(index);
                     self.selected_item = match (self.selected_item, self.history.is_empty()) {
@@ -805,18 +834,29 @@ impl cosmic::Application for ClipboardWindow {
                         (None, false) => None,
                     };
                 }
-                self.hovered_item = None;
                 report_temp_cleanup(
                     &self.history,
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
-                return self.refresh_search();
+                return dismiss_preview.chain(self.refresh_search());
             }
             WindowMessage::HoverItem(index) => {
-                self.hovered_item = index.filter(|index| *index < self.history.len());
+                let next = index.filter(|index| *index < self.history.len());
+                if self.hovered_item != next {
+                    let dismiss_preview = self
+                        .hovered_item
+                        .map(|index| self.preview_popup_task(index))
+                        .unwrap_or_else(Task::none);
+                    self.hovered_item = next;
+                    return dismiss_preview;
+                }
+            }
+            WindowMessage::DismissPreview(index) => {
+                return self.preview_popup_task(index);
             }
             WindowMessage::ClearHistory => {
+                let dismiss_preview = self.dismiss_hovered_preview();
                 self.history.clear();
                 self.selected_item = None;
                 report_temp_cleanup(
@@ -824,7 +864,7 @@ impl cosmic::Application for ClipboardWindow {
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
-                return self.refresh_search();
+                return dismiss_preview.chain(self.refresh_search());
             }
             WindowMessage::Shutdown => {
                 report_temp_cleanup(
@@ -891,6 +931,7 @@ impl cosmic::Application for ClipboardWindow {
                 if self.content_window == Some(id) {
                     self.content_window = None;
                     self.content_window_focused = false;
+                    return self.dismiss_hovered_preview();
                 }
                 if self.closing_window == Some(id) {
                     self.closing_window = None;
@@ -913,11 +954,11 @@ impl cosmic::Application for ClipboardWindow {
             WindowMessage::WindowEvent(id, window::Event::Unfocused)
                 if self.content_window == Some(id) && self.content_window_focused =>
             {
-                self.hovered_item = None;
                 return self.close_content_window();
             }
             WindowMessage::WindowEvent(_, _) => {}
             WindowMessage::SetHistoryLimit(limit) => {
+                let dismiss_preview = self.dismiss_hovered_preview();
                 self.max_history_items = limit;
                 self.history.truncate(limit);
                 self.selected_item = self
@@ -928,7 +969,7 @@ impl cosmic::Application for ClipboardWindow {
                     self.active_generated_file.as_deref(),
                     &mut self.generated_files,
                 );
-                return self.refresh_search();
+                return dismiss_preview.chain(self.refresh_search());
             }
             WindowMessage::Surface(action) => {
                 return cosmic::task::message(cosmic::Action::Cosmic(
@@ -1008,6 +1049,10 @@ impl cosmic::Application for ClipboardWindow {
                 );
             }
             WindowMessage::KeyboardInput(_, _) => {}
+            WindowMessage::PointerLeft(id) if self.content_window == Some(id) => {
+                return self.dismiss_hovered_preview();
+            }
+            WindowMessage::PointerLeft(_) => {}
             WindowMessage::SearchInput(query) => {
                 self.search_query = query;
                 return self.refresh_search();
@@ -1120,6 +1165,13 @@ struct HistoryItem {
     to_data_autosize_id: widget::Id,
 }
 
+fn image_preview_popup_id(history: &[HistoryItem], index: usize) -> Option<Id> {
+    history
+        .get(index)
+        .filter(|item| item.image_preview_handle.is_some())
+        .map(|item| item.preview_popup_id)
+}
+
 fn single_regular_file_path(files: &clipboard_watcher::ClipboardFiles) -> Option<&Path> {
     match files.entries.as_slice() {
         [entry] if !entry.is_dir => entry.path.as_deref(),
@@ -1196,15 +1248,11 @@ fn record_history(
     });
     let image_preview_handle = existing_image_preview_handle.or_else(|| {
         update.image.as_ref().map(|image| {
-            if image.is_svg {
-                ImagePreviewHandle::Svg(cosmic::iced::widget::svg::Handle::from_memory(
-                    image.bytes.as_ref().to_vec(),
-                ))
-            } else {
-                ImagePreviewHandle::Raster(cosmic::iced::widget::image::Handle::from_bytes(
-                    cosmic::iced::core::Bytes::from_owner(image.bytes.clone()),
-                ))
-            }
+            ImagePreviewHandle(cosmic::iced::widget::image::Handle::from_rgba(
+                image.preview_width,
+                image.preview_height,
+                image.preview_rgba.as_ref().to_vec(),
+            ))
         })
     });
     history.insert(
@@ -1480,7 +1528,9 @@ fn history_list(
                 } else {
                     thumbnail
                 };
-                item_content.push(thumbnail);
+                let thumbnail =
+                    widget::mouse_area(thumbnail).on_exit(WindowMessage::DismissPreview(index));
+                item_content.push(thumbnail.into());
                 item_content.push(widget::Space::new().width(6.0).into());
             } else if let Some(files) = &item.files {
                 let icon_name = if files.entries.iter().all(|entry| entry.is_dir) {
@@ -1683,10 +1733,7 @@ struct HistoryTooltip {
 }
 
 #[derive(Clone, Debug)]
-enum ImagePreviewHandle {
-    Raster(cosmic::iced::widget::image::Handle),
-    Svg(cosmic::iced::widget::svg::Handle),
-}
+struct ImagePreviewHandle(cosmic::iced::widget::image::Handle);
 
 fn wayland_tooltip(
     content: impl Into<Element<'static, WindowMessage>>,
@@ -1732,19 +1779,13 @@ fn wayland_tooltip(
             }),
             move || {
                 let tooltip_content = if let Some(handle) = tooltip.image.clone() {
-                    let preview: Element<'static, cosmic::Action<WindowMessage>> = match handle {
-                        ImagePreviewHandle::Raster(handle) => widget::image(handle)
+                    let preview: Element<'static, cosmic::Action<WindowMessage>> =
+                        widget::image(handle.0)
                             .width(1920.0)
                             .height(1080.0)
                             .content_fit(cosmic::iced::ContentFit::Contain)
-                            .border_radius(8.0)
-                            .into(),
-                        ImagePreviewHandle::Svg(handle) => widget::svg(handle)
-                            .width(1920.0)
-                            .height(1080.0)
-                            .content_fit(cosmic::iced::ContentFit::Contain)
-                            .into(),
-                    };
+                            .filter_method(cosmic::iced::widget::image::FilterMethod::Nearest)
+                            .into();
                     widget::column::with_children([preview])
                 } else {
                     widget::column::with_children([widget::text(tooltip.text.clone()).into()])
@@ -1758,7 +1799,7 @@ fn wayland_tooltip(
             WindowMessage::Surface(cosmic::surface::action::destroy_popup(popup_id)),
             WindowMessage::Surface,
         )
-        .delay(Duration::from_millis(if is_image { 1_200 } else { 350 }));
+        .delay(Duration::from_millis(if is_image { 150 } else { 350 }));
     if fill_width {
         tooltip_widget.width(Length::Fill).into()
     } else {
@@ -1989,6 +2030,19 @@ mod tests {
         assert!(activate_history_item(&mut history, &mut selected, 4).is_none());
         assert_eq!(selected, Some(0));
         assert_eq!(history[0].text, "only");
+    }
+
+    #[test]
+    fn preview_popup_is_only_selected_for_image_entries() {
+        let mut entry = item("preview");
+        let popup_id = entry.preview_popup_id;
+
+        assert_eq!(image_preview_popup_id(&[entry.clone()], 0), None);
+
+        entry.image_preview_handle = Some(ImagePreviewHandle(
+            cosmic::iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4]),
+        ));
+        assert_eq!(image_preview_popup_id(&[entry], 0), Some(popup_id));
     }
 
     #[test]
