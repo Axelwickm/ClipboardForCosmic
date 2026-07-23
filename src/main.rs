@@ -388,6 +388,7 @@ impl InstanceGuard {
 
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(state_dir.join("jax-clipboard-history.lock"))?;
@@ -589,12 +590,12 @@ impl cosmic::Application for ClipboardWindow {
                 self.selected_item = (!self.history.is_empty()).then_some(0);
             }
             WindowMessage::ActivateItem(index) => {
-                let Some(text) =
+                let Some(item) =
                     activate_history_item(&mut self.history, &mut self.selected_item, index)
                 else {
                     return Task::none();
                 };
-                clipboard_watcher::copy_text(text);
+                activate_clipboard_content(item);
                 return self.close_content_window();
             }
             WindowMessage::DeleteItem(index) => {
@@ -714,13 +715,13 @@ impl cosmic::Application for ClipboardWindow {
                 let current = self.selected_item.unwrap_or(0).min(self.history.len() - 1);
                 match key {
                     NavigationKey::Enter => {
-                        let text = activate_history_item(
+                        let item = activate_history_item(
                             &mut self.history,
                             &mut self.selected_item,
                             current,
                         )
                         .expect("validated history index");
-                        clipboard_watcher::copy_text(text);
+                        activate_clipboard_content(item);
                         return self.close_content_window();
                     }
                     NavigationKey::Up => {
@@ -785,9 +786,15 @@ struct HistoryItem {
     text: String,
     mime_type: String,
     available_mime_types: Vec<String>,
+    color_rgba: Option<[u8; 4]>,
+    image: Option<clipboard_watcher::ClipboardImage>,
+    image_handle: Option<cosmic::iced::widget::image::Handle>,
+    image_preview_handle: Option<cosmic::iced::widget::image::Handle>,
     captured_at: SystemTime,
     tooltip_popup_id: Id,
     tooltip_autosize_id: widget::Id,
+    preview_popup_id: Id,
+    preview_autosize_id: widget::Id,
 }
 
 fn record_history(
@@ -798,23 +805,72 @@ fn record_history(
     if update.text.trim().is_empty() {
         return;
     }
-    let tooltip_ids = history
+    let existing = history
         .iter()
-        .position(|entry| entry.text == update.text)
+        .position(|entry| match (&entry.image, &update.image) {
+            (Some(existing), Some(incoming)) => existing.bytes == incoming.bytes,
+            (None, None) => entry.text == update.text,
+            _ => false,
+        })
         .map(|index| {
             let existing = history.remove(index);
-            (existing.tooltip_popup_id, existing.tooltip_autosize_id)
+            (
+                existing.tooltip_popup_id,
+                existing.tooltip_autosize_id,
+                existing.preview_popup_id,
+                existing.preview_autosize_id,
+                existing.image_handle,
+                existing.image_preview_handle,
+            )
+        });
+    let (
+        tooltip_popup_id,
+        tooltip_autosize_id,
+        preview_popup_id,
+        preview_autosize_id,
+        existing_image_handle,
+        existing_image_preview_handle,
+    ) = existing.unwrap_or_else(|| {
+        (
+            Id::unique(),
+            widget::Id::unique(),
+            Id::unique(),
+            widget::Id::unique(),
+            None,
+            None,
+        )
+    });
+    let image_handle = existing_image_handle.or_else(|| {
+        update.image.as_ref().map(|image| {
+            cosmic::iced::widget::image::Handle::from_rgba(
+                image.thumbnail_width,
+                image.thumbnail_height,
+                image.thumbnail_rgba.as_ref().to_vec(),
+            )
         })
-        .unwrap_or_else(|| (Id::unique(), widget::Id::unique()));
+    });
+    let image_preview_handle = existing_image_preview_handle.or_else(|| {
+        update.image.as_ref().map(|image| {
+            cosmic::iced::widget::image::Handle::from_bytes(cosmic::iced::core::Bytes::from_owner(
+                image.bytes.clone(),
+            ))
+        })
+    });
     history.insert(
         0,
         HistoryItem {
             text: update.text,
             mime_type: update.mime_type,
             available_mime_types: update.available_mime_types,
+            color_rgba: update.color_rgba,
+            image: update.image,
+            image_handle,
+            image_preview_handle,
             captured_at: update.captured_at,
-            tooltip_popup_id: tooltip_ids.0,
-            tooltip_autosize_id: tooltip_ids.1,
+            tooltip_popup_id,
+            tooltip_autosize_id,
+            preview_popup_id,
+            preview_autosize_id,
         },
     );
     history.truncate(limit);
@@ -826,15 +882,33 @@ fn activate_history_item(
     history: &mut Vec<HistoryItem>,
     selected_item: &mut Option<usize>,
     index: usize,
-) -> Option<String> {
+) -> Option<ActivatedClipboardItem> {
     if index >= history.len() {
         return None;
     }
     let item = history.remove(index);
-    let text = item.text.clone();
+    let activated = ActivatedClipboardItem {
+        text: item.text.clone(),
+        color_rgba: item.color_rgba,
+        image: item.image.clone(),
+    };
     history.insert(0, item);
     *selected_item = Some(0);
-    Some(text)
+    Some(activated)
+}
+
+struct ActivatedClipboardItem {
+    text: String,
+    color_rgba: Option<[u8; 4]>,
+    image: Option<clipboard_watcher::ClipboardImage>,
+}
+
+fn activate_clipboard_content(item: ActivatedClipboardItem) {
+    if let Some(image) = item.image {
+        clipboard_watcher::copy_image(image);
+    } else {
+        clipboard_watcher::copy_text_with_color(item.text, item.color_rgba);
+    }
 }
 
 fn history_list(
@@ -856,10 +930,63 @@ fn history_list(
             let preview = history_preview(&item.text);
             let tooltip = history_tooltip(item);
             let selected = selected_item == Some(index);
-            let item_content = vec![
+            let mut item_content = vec![
                 widget::text(if selected { "›" } else { " " })
                     .width(14.0)
                     .into(),
+            ];
+            if let Some(handle) = &item.image_handle {
+                let thumbnail: Element<'static, WindowMessage> = widget::image(handle.clone())
+                    .width(16.0)
+                    .height(16.0)
+                    .content_fit(cosmic::iced::ContentFit::Cover)
+                    .border_radius(4.0)
+                    .into();
+                let thumbnail = if let Some(preview_handle) = item.image_preview_handle.clone() {
+                    wayland_tooltip(
+                        thumbnail,
+                        HistoryTooltip {
+                            text: String::new(),
+                            image: Some(preview_handle),
+                        },
+                        parent_window.unwrap_or(Id::RESERVED),
+                        item.preview_popup_id,
+                        item.preview_autosize_id.clone(),
+                    )
+                } else {
+                    thumbnail
+                };
+                item_content.push(thumbnail);
+                item_content.push(widget::Space::new().width(6.0).into());
+            } else if let Some(rgba) = item.color_rgba {
+                let [red, green, blue, alpha] = rgba;
+                item_content.push(
+                    widget::container(widget::Space::new().width(16.0).height(16.0))
+                        .width(16.0)
+                        .height(16.0)
+                        .class(cosmic::theme::Container::custom(move |_| {
+                            widget::container::Style {
+                                background: Some(cosmic::iced::Background::Color(
+                                    cosmic::iced::Color::from_rgba8(
+                                        red,
+                                        green,
+                                        blue,
+                                        alpha as f32 / 255.0,
+                                    ),
+                                )),
+                                border: cosmic::iced::Border {
+                                    color: cosmic::iced::Color::from_rgba(0.5, 0.5, 0.5, 0.5),
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
+                                ..Default::default()
+                            }
+                        }))
+                        .into(),
+                );
+                item_content.push(widget::Space::new().width(6.0).into());
+            }
+            item_content.extend([
                 widget::text(preview)
                     .width(Length::Fill)
                     .wrapping(text::Wrapping::None)
@@ -868,7 +995,7 @@ fn history_list(
                 widget::Space::new()
                     .width(HISTORY_ACTION_WIDTH + 4.0)
                     .into(),
-            ];
+            ]);
             let item_button = widget::button::custom(
                 widget::row::with_children(item_content).align_y(Alignment::Center),
             )
@@ -946,9 +1073,15 @@ fn history_list(
         .into()
 }
 
+#[derive(Clone)]
+struct HistoryTooltip {
+    text: String,
+    image: Option<cosmic::iced::widget::image::Handle>,
+}
+
 fn wayland_tooltip(
     content: impl Into<Element<'static, WindowMessage>>,
-    tooltip: String,
+    tooltip: HistoryTooltip,
     parent: Id,
     popup_id: Id,
     autosize_id: widget::Id,
@@ -960,13 +1093,14 @@ fn wayland_tooltip(
         SctkPopupSettings, SctkPositioner,
     };
 
+    let is_image = tooltip.image.is_some();
     cosmic::widget::wayland::tooltip::widget::Tooltip::<WindowMessage, WindowMessage>::new(
         content,
         Some(move |bounds: cosmic::iced::Rectangle| SctkPopupSettings {
             parent,
             id: popup_id,
             grab: false,
-            input_zone: None,
+            input_zone: is_image.then(Vec::new),
             positioner: SctkPositioner {
                 size: None,
                 size_limits: cosmic::iced::Limits::NONE.min_width(1.0).min_height(1.0),
@@ -986,8 +1120,18 @@ fn wayland_tooltip(
             close_with_children: true,
         }),
         move || {
+            let tooltip_content = if let Some(handle) = tooltip.image.clone() {
+                widget::column::with_children([widget::image(handle)
+                    .width(1920.0)
+                    .height(1080.0)
+                    .content_fit(cosmic::iced::ContentFit::Contain)
+                    .border_radius(8.0)
+                    .into()])
+            } else {
+                widget::column::with_children([widget::text(tooltip.text.clone()).into()])
+            };
             widget::autosize::autosize(
-                widget::layer_container(widget::text(tooltip.clone())).padding(6),
+                widget::layer_container(tooltip_content).padding(6),
                 autosize_id.clone(),
             )
             .into()
@@ -995,11 +1139,11 @@ fn wayland_tooltip(
         WindowMessage::Surface(cosmic::surface::action::destroy_popup(popup_id)),
         WindowMessage::Surface,
     )
-    .delay(Duration::from_millis(350))
+    .delay(Duration::from_millis(if is_image { 1_200 } else { 350 }))
     .into()
 }
 
-fn history_tooltip(item: &HistoryItem) -> String {
+fn history_tooltip(item: &HistoryItem) -> HistoryTooltip {
     let characters = item.text.chars().count();
     let bytes = item.text.len();
     let lines = item.text.lines().count().max(1);
@@ -1008,10 +1152,24 @@ fn history_tooltip(item: &HistoryItem) -> String {
         .map(|duration| format_capture_time(item.captured_at, duration.as_secs()))
         .unwrap_or_else(|_| format_local_timestamp(item.captured_at));
     let offered = item.available_mime_types.join(", ");
-    format!(
-        "{characters} characters · {bytes} UTF-8 bytes · {lines} lines\nMIME: {}\nAvailable types: {offered}\nCaptured: {captured}",
-        item.mime_type
-    )
+    let color = item
+        .color_rgba
+        .map(clipboard_watcher::format_color)
+        .map(|color| format!("\nColor: {color}"))
+        .unwrap_or_default();
+    let text = if let Some(image) = &item.image {
+        format!(
+            "{}\nMIME: {}\nAvailable types: {offered}\nCaptured: {captured}",
+            clipboard_watcher::image_label(image),
+            item.mime_type
+        )
+    } else {
+        format!(
+            "{characters} characters · {bytes} UTF-8 bytes · {lines} lines\nMIME: {}\nAvailable types: {offered}\nCaptured: {captured}",
+            item.mime_type
+        ) + &color
+    };
+    HistoryTooltip { text, image: None }
 }
 
 fn format_capture_time(captured_at: SystemTime, seconds: u64) -> String {
@@ -1091,9 +1249,15 @@ mod tests {
             text: text.into(),
             mime_type: "text/plain".into(),
             available_mime_types: vec!["text/plain".into()],
+            color_rgba: clipboard_watcher::parse_color_expression(text),
+            image: None,
+            image_handle: None,
+            image_preview_handle: None,
             captured_at: SystemTime::now(),
             tooltip_popup_id: Id::unique(),
             tooltip_autosize_id: widget::Id::unique(),
+            preview_popup_id: Id::unique(),
+            preview_autosize_id: widget::Id::unique(),
         }
     }
 
@@ -1104,7 +1268,10 @@ mod tests {
 
         let copied = activate_history_item(&mut history, &mut selected, 1);
 
-        assert_eq!(copied.as_deref(), Some("middle"));
+        assert_eq!(
+            copied.as_ref().map(|item| item.text.as_str()),
+            Some("middle")
+        );
         assert_eq!(selected, Some(0));
         assert_eq!(
             history
@@ -1120,7 +1287,7 @@ mod tests {
         let mut history = vec![item("only")];
         let mut selected = Some(0);
 
-        assert_eq!(activate_history_item(&mut history, &mut selected, 4), None);
+        assert!(activate_history_item(&mut history, &mut selected, 4).is_none());
         assert_eq!(selected, Some(0));
         assert_eq!(history[0].text, "only");
     }

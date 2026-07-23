@@ -8,6 +8,7 @@ description = "A clipboard history application for the COSMIC desktop"
 [dependencies]
 dirs = "6"
 fs2 = "0.4"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 ksni = { version = "0.3.6", features = ["blocking"] }
 libc = "0.2"
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", default-features = false, features = ["tokio", "wayland", "wgpu"] }
